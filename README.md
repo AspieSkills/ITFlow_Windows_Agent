@@ -1,6 +1,6 @@
 # ITFlow Agent — User Manual
 
-## Version 7.0 | PowerShell 5.1 | Windows
+## Version 7.1 | PowerShell 5.1 | Windows
 
 ---
 
@@ -31,7 +31,7 @@ ITFlow Agent is a PowerShell-based tool that syncs Windows machine inventory to 
 
 ## 2.1 Quick Start (GUI)
 
-1. Run the script: `.\ITFlow-Agent-v7.0.ps1`
+1. Run the script: `.\ITFlow-Agent-v7.1.ps1`
 2. Click **Config** and enter:
    - **ITFlow Base URL**: `https://itflow.yourdomain.com`
    - **Client ID**: The ITFlow client ID this machine belongs to
@@ -44,7 +44,7 @@ ITFlow Agent is a PowerShell-based tool that syncs Windows machine inventory to 
 
 ```powershell
 # One-line setup (run as Administrator):
-.\ITFlow-Agent-v7.0.ps1 -Install
+.\ITFlow-Agent-v7.1.ps1 -Install
 ```
 
 This writes config to registry, copies the script to `C:\ProgramData\ITFlow\ITFlow-Agent.ps1`, and creates a scheduled task that runs the agent at every system startup.
@@ -52,7 +52,7 @@ This writes config to registry, copies the script to `C:\ProgramData\ITFlow\ITFl
 For GPO deployment: pre-configure registry keys, then run:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File "\\server\share\ITFlow-Agent-v7.0.ps1" -Install -TaskScriptPath "C:\ProgramData\ITFlow\ITFlow-Agent.ps1"
+powershell.exe -ExecutionPolicy Bypass -File "\\server\share\ITFlow-Agent-v7.1.ps1" -Install
 ```
 
 On subsequent GPO runs (same version), the `-Install` switch detects the installed version matches and only triggers the task without re-copying.
@@ -132,7 +132,7 @@ When run from a USB stick or non-elevated, the agent detects that the registry i
 
 ## 4.1 GUI Mode
 
-Run without switches: `.\ITFlow-Agent-v7.0.ps1`
+Run without switches: `.\ITFlow-Agent-v7.1.ps1`
 
 ### Window Layout
 The GUI is a single compact window with three areas stacked vertically. Window width is locked on first display; height expands when details are shown.
