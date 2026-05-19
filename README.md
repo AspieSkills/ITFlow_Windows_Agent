@@ -215,7 +215,6 @@ The overview panel auto-refreshes every 30 seconds (stops during sync). After a 
 | `-Rename` | Allow automatic computer rename in silent mode (used with `-Silent`). |
 | `-Install` | Install the agent: write config to registry, copy script to `C:\ProgramData\ITFlow\`, create scheduled task. |
 | `-Uninstall` | Remove the agent: delete task, registry keys, and `C:\ProgramData\ITFlow`. |
-| `-TaskScriptPath` | Specify the script path for the scheduled task (required for GPO deployment). |
 | `-Reboot` | After successful rename in silent mode, reboot the computer (60s delay). |
 | `-Worker` | Internal flag used by the GUI's async engine. Not for direct use. |
 
@@ -225,7 +224,7 @@ The overview panel auto-refreshes every 30 seconds (stops during sync). After a 
 powershell.exe -ExecutionPolicy Bypass -File "C:\ProgramData\ITFlow\ITFlow-Agent.ps1" -Silent -Rename
 
 # Install from network share:
-powershell.exe -ExecutionPolicy Bypass -File "\\server\share\ITFlow-Agent-v7.0.ps1" -Install -TaskScriptPath "C:\ProgramData\ITFlow\ITFlow-Agent.ps1"
+powershell.exe -ExecutionPolicy Bypass -File "\\server\share\ITFlow-Agent-v7.0.ps1" -Install
 ```
 
 ## 4.3 Scheduled Task
@@ -235,7 +234,7 @@ When installed via the **Install** button or `-Install` switch, a task named `IT
 | Property | Value |
 |----------|-------|
 | **Trigger** | At startup (resets to startup after successful sync) |
-| **Action** | `powershell.exe -ExecutionPolicy Bypass -File "C:\ProgramData\ITFlow\ITFlow-Agent.ps1" -Silent -Rename -Worker` |
+| **Action** | `powershell.exe -ExecutionPolicy Bypass -File "C:\ProgramData\ITFlow\ITFlow-Agent.ps1" -Silent -Rename |
 | **Run as** | SYSTEM |
 | **Run with highest privileges** | Yes |
 | **Execution time limit** | 15 minutes (default is 3 days) |
