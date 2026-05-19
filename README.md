@@ -63,7 +63,7 @@ On subsequent GPO runs (same version), the `-Install` switch detects the install
 
 **Command line**: 
 ```powershell
-.\ITFlow-Agent-v7.0.ps1 -Uninstall
+.\ITFlow-Agent-v7.1.ps1 -Uninstall
 ```
 Removes the scheduled task, all registry keys under `HKLM:\SOFTWARE\ITFlow`, and the `C:\ProgramData\ITFlow` folder.
 
@@ -234,7 +234,7 @@ When installed via the **Install** button or `-Install` switch, a task named `IT
 | Property | Value |
 |----------|-------|
 | **Trigger** | At startup (resets to startup after successful sync) |
-| **Action** | `powershell.exe -ExecutionPolicy Bypass -File "C:\ProgramData\ITFlow\ITFlow-Agent.ps1" -Silent -Rename |
+| **Action** | `powershell.exe -ExecutionPolicy Bypass -File "C:\ProgramData\ITFlow\ITFlow-Agent.ps1" -Silent -Rename -Worker|
 | **Run as** | SYSTEM |
 | **Run with highest privileges** | Yes |
 | **Execution time limit** | 15 minutes (default is 3 days) |
