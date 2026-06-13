@@ -1,4 +1,4 @@
-﻿# =====================================================
+# =====================================================
 # ITFlow PowerShell Agent
 # version - 7.4.2
 # PowerShell 5.1 Compatible
@@ -10,7 +10,7 @@ param(
 
     # NEW: internal worker-mode for background runspace execution
     [switch]$Worker,
-a
+
     # NEW: allow the GUI to force the worker to use the same log file
     [string]$LogPath,
 
@@ -77,10 +77,9 @@ $script:LastRunState = [pscustomobject]@{
     ClientIdAutoUpdated= $false
     SysInfoPath        = ""
     SysInfoCollectedAt = ""
+    RenameRequired     = $false
+    TargetHostname     = ""
 }
-# Ensure rename prompt properties exist (v5.0)
-if (-not ($script:LastRunState.PSObject.Properties.Name -contains 'RenameRequired')) { $script:LastRunState | Add-Member -NotePropertyName RenameRequired -NotePropertyValue $false }
-if (-not ($script:LastRunState.PSObject.Properties.Name -contains 'TargetHostname')) { $script:LastRunState | Add-Member -NotePropertyName TargetHostname -NotePropertyValue '' }
 
 
 # Prevent duplicate Local vs ITFlow compare blocks per run
@@ -107,7 +106,7 @@ function Throw-IfCancelRequested {
     }
 }
 
-function Start-CancelAwareSleep {
+function Start-SleepCancelAware {
     param([Parameter(Mandatory=$true)][int]$Seconds)
 
     for ($i = 0; $i -lt $Seconds; $i++) {
@@ -138,7 +137,7 @@ function Clear-RenameFlags {
 # Asset Transfer Mismatch Helper
 #===============================
 
-function Log-AssetTransferMismatch {
+function Write-AssetTransferLog {
     param(
         [string]$Serial,
         [string]$Hostname,
@@ -152,40 +151,72 @@ function Log-AssetTransferMismatch {
         ($(if ($AllowFollowClientTransfer) { "FOLLOW" } else { "ABORT" })))
 }
 
-function Show-SysInfoSummary {
+# ===============================
+# Unified Asset Transfer Follow
+# ===============================
+function Invoke-AssetTransferFollow {
+    param(
+        [Parameter(Mandatory=$true)][pscustomobject]$Inv,
+        [Parameter(Mandatory=$true)][int]$DiscoveredClientId,
+        [Parameter(Mandatory=$true)][int]$DiscoveredAssetId,
+        [string]$DeviceSpec = ""
+    )
 
-    $path = "C:\ProgramData\ITFlow\sysinfo_$($env:COMPUTERNAME).json"
+    $origClientId = [int]$Config.ClientId
+    Write-AssetTransferLog -Serial $Inv.Serial -Hostname $Inv.Hostname `
+        -ConfiguredClientId $origClientId -DiscoveredClientId $DiscoveredClientId -DiscoveredAssetId $DiscoveredAssetId
 
-    if (-not (Test-Path $path)) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Sysinfo file not found:`r`n$path",
-            "SysInfo",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
-        return
+    if (-not $AllowFollowClientTransfer -or $DiscoveredClientId -le 0) {
+        Log "WARNING: Serial '$($Inv.Serial)' exists in ITFlow under client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId). Aborting."
+        if ($CreateTransferMismatchTicket) {
+            $title = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
+            $details = "Configured Client ID: $origClientId`nDiscovered Client ID: $DiscoveredClientId`nDiscovered Asset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
+            Create-ITFlowTicket -Title $title -ClientId $origClientId -AssetId $DiscoveredAssetId -Details $details | Out-Null
+        }
+        return [pscustomobject]@{ Followed = $false }
     }
+
+    if ($EnableTicketingSilent) {
+        $title = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
+        $details = "Original Client ID: $origClientId`nDiscovered Client ID: $DiscoveredClientId`nDiscovered Asset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
+        Create-ITFlowTicket -Title $title -ClientId $origClientId -AssetId $DiscoveredAssetId -Details $details | Out-Null
+    }
+
+    $script:LastRunState.TransferFollowed = $true
+
+    if ($AutoUpdateClientIdOnTransfer -and $DiscoveredClientId -ne $origClientId) {
+        Log "Auto-update enabled: persisting ClientId change $origClientId -> $DiscoveredClientId"
+        $persistOk = Set-ConfiguredClientId -NewClientId $DiscoveredClientId
+        if ($persistOk) { $script:LastRunState.ClientIdAutoUpdated = $true }
+    }
+
+    if ($EnableTicketingSilent) {
+        $title = "[TRANSFER FOLLOWED] $($Inv.Hostname) | Serial: $($Inv.Serial) now in client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
+        $details = "Original Client ID: $origClientId`nNew Client ID: $DiscoveredClientId`nAsset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`nAuto-Update: $($AutoUpdateClientIdOnTransfer)`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
+        Create-ITFlowTicket -Title $title -ClientId $DiscoveredClientId -AssetId $DiscoveredAssetId -Details $details | Out-Null
+    }
+
+    $script:CurrentAssetId = $DiscoveredAssetId
+    Log "Following transfer: EffectiveClientId updated to $DiscoveredClientId (asset_id=$DiscoveredAssetId)"
+
+    return [pscustomobject]@{ Followed = $true; DiscoveredClientId = $DiscoveredClientId; DiscoveredAssetId = $DiscoveredAssetId }
+}
+
+function Get-SysInfoSummaryText {
+    param([string]$Path = "C:\ProgramData\ITFlow\sysinfo_$($env:COMPUTERNAME).json")
+
+    if (-not (Test-Path $Path)) { return $null }
 
     try {
-        $raw = Get-Content -Path $path -Raw -ErrorAction Stop
+        $raw = Get-Content -Path $Path -Raw -ErrorAction Stop
         $obj = $raw | ConvertFrom-Json -ErrorAction Stop
-    }
-    catch {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Failed to read/parse sysinfo JSON:`r`n$path`r`n`r`n$($_ | Out-String)",
-            "SysInfo",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Error
-        ) | Out-Null
-        return
-    }
+    } catch { return $null }
 
-    # Build a readable summary
     $sb = New-Object System.Text.StringBuilder
 
     $null = $sb.AppendLine("SysInfo Summary")
     $null = $sb.AppendLine("==============")
-    $null = $sb.AppendLine("File:     $path")
+    $null = $sb.AppendLine("File:     $Path")
     if ($obj.Meta) {
         $null = $sb.AppendLine("Collected: $($obj.Meta.CollectedAt)")
         $null = $sb.AppendLine("Agent:     $($obj.Meta.AgentVersion)")
@@ -193,57 +224,56 @@ function Show-SysInfoSummary {
     $null = $sb.AppendLine("")
 
     if ($obj.Device) {
-        $null = $sb.AppendLine("Device")
-        $null = $sb.AppendLine("------")
+        $null = $sb.AppendLine("Device"); $null = $sb.AppendLine("------")
         $null = $sb.AppendLine("Hostname:   $($obj.Device.Hostname)")
         $null = $sb.AppendLine("Serial:     $($obj.Device.Serial)")
         $null = $sb.AppendLine("Make/Model: $($obj.Device.Make) / $($obj.Device.Model)")
         $null = $sb.AppendLine("OS:         $($obj.Device.OS)")
         $null = $sb.AppendLine("Type:       $($obj.Device.AssetType)")
         $null = $sb.AppendLine("MAC:        $($obj.Device.PrimaryMAC)")
-        $null = $sb.AppendLine("IP:         $($obj.Device.PrimaryIP)")
-        $null = $sb.AppendLine("")
+        $null = $sb.AppendLine("IP:         $($obj.Device.PrimaryIP)"); $null = $sb.AppendLine("")
     }
-
     if ($obj.CPU) {
-        $null = $sb.AppendLine("CPU")
-        $null = $sb.AppendLine("---")
+        $null = $sb.AppendLine("CPU"); $null = $sb.AppendLine("---")
         $null = $sb.AppendLine("Name:       $($obj.CPU.Name)")
         $null = $sb.AppendLine("Cores/CPU:  $($obj.CPU.CoreCount) / $($obj.CPU.LogicalCount)")
-        $null = $sb.AppendLine("Max MHz:    $($obj.CPU.MaxClockMHz)")
-        $null = $sb.AppendLine("")
+        $null = $sb.AppendLine("Max MHz:    $($obj.CPU.MaxClockMHz)"); $null = $sb.AppendLine("")
     }
-
     if ($obj.Memory) {
-        $null = $sb.AppendLine("Memory")
-        $null = $sb.AppendLine("------")
-        $null = $sb.AppendLine("Total GB:   $($obj.Memory.TotalGB)")
-        $null = $sb.AppendLine("")
+        $null = $sb.AppendLine("Memory"); $null = $sb.AppendLine("------")
+        $null = $sb.AppendLine("Total GB:   $($obj.Memory.TotalGB)"); $null = $sb.AppendLine("")
     }
-
     if ($obj.Storage -and $obj.Storage.Totals) {
-        $null = $sb.AppendLine("Storage")
-        $null = $sb.AppendLine("-------")
+        $null = $sb.AppendLine("Storage"); $null = $sb.AppendLine("-------")
         $null = $sb.AppendLine("Physical Total GB: $($obj.Storage.Totals.PhysicalTotalGB)")
-        $null = $sb.AppendLine("Volume Total GB:   $($obj.Storage.Totals.VolumeTotalGB)")
-        $null = $sb.AppendLine("")
+        $null = $sb.AppendLine("Volume Total GB:   $($obj.Storage.Totals.VolumeTotalGB)"); $null = $sb.AppendLine("")
     }
-
     if ($obj.Displays) {
-        $null = $sb.AppendLine("Displays")
-        $null = $sb.AppendLine("--------")
-        $null = $sb.AppendLine("Count: $(@($obj.Displays).Count)")
-        $null = $sb.AppendLine("")
+        $null = $sb.AppendLine("Displays"); $null = $sb.AppendLine("--------")
+        $null = $sb.AppendLine("Count: $(@($obj.Displays).Count)"); $null = $sb.AppendLine("")
     }
-
     if ($obj.Network -and $obj.Network.Adapters) {
-        $null = $sb.AppendLine("Network")
-        $null = $sb.AppendLine("-------")
-        $null = $sb.AppendLine("Adapters: $(@($obj.Network.Adapters).Count)")
-        $null = $sb.AppendLine("")
+        $null = $sb.AppendLine("Network"); $null = $sb.AppendLine("-------")
+        $null = $sb.AppendLine("Adapters: $(@($obj.Network.Adapters).Count)"); $null = $sb.AppendLine("")
     }
 
-    # Show in a simple dialog (multiline textbox form so it's readable/copyable)
+    return $sb.ToString()
+}
+
+function Show-SysInfoSummary {
+    $path = "C:\ProgramData\ITFlow\sysinfo_$($env:COMPUTERNAME).json"
+    $text = Get-SysInfoSummaryText -Path $path
+
+    if ($null -eq $text) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Sysinfo file not found or unreadable:`r`n$path",
+            "SysInfo",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        return
+    }
+
     $f = New-Object System.Windows.Forms.Form
     $f.Text = "SysInfo Summary"
     $f.StartPosition = "CenterParent"
@@ -255,7 +285,7 @@ function Show-SysInfoSummary {
     $tb.ScrollBars = "Vertical"
     $tb.Dock = "Fill"
     $tb.Font = New-Object System.Drawing.Font("Consolas", 10)
-    $tb.Text = $sb.ToString()
+    $tb.Text = $text
     $f.Controls.Add($tb)
 
     $f.ShowDialog() | Out-Null
@@ -373,13 +403,14 @@ function Sync-ADComputerAttributes {
     param(
         [Parameter(Mandatory=$true)]$Snapshot,
         [string]$DeviceSpec = "",
-        [string]$LastCheckIn = ""
+        [string]$LastCheckIn = "",
+        $ComputerSystem = $null
     )
 
     # Only attempt on domain-joined machines
     try {
-        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
-        if (-not $cs.PartOfDomain) { Log "AD attribute sync skipped: not domain-joined"; return }
+        if (-not $ComputerSystem) { $ComputerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop }
+        if (-not $ComputerSystem.PartOfDomain) { Log "AD attribute sync skipped: not domain-joined"; return }
     } catch { return }
 
     try {
@@ -559,8 +590,8 @@ function Set-ConfiguredClientId {
     if (-not $script:RegistryAllowed) {
         Log "Config ClientId updated in memory: $NewClientId"
         if (Test-Path $IniPath) {
-            $content = Get-Content $IniPath -Raw
-            $content = $content -replace "(?m)^ClientId=.*", "ClientId=$NewClientId"
+            $content = [System.IO.File]::ReadAllText($IniPath)
+            $content = $content -replace "(?m)(?<=^\[ITFlow\]\r?\n.*?)^ClientId=.*", "ClientId=$NewClientId"
             try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch {
                 Start-Sleep -Milliseconds 200
                 try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
@@ -656,11 +687,30 @@ function Read-RegValue {
     if (Test-Path $IniPath) {
         $section = $Path.Substring($RegRoot.Length + 1)
         try {
-            $raw = Get-Content $IniPath -Raw
+            $raw = [System.IO.File]::ReadAllText($IniPath)
             if ($raw -match "(?ms)\[$section\].*?^$Name=([^\r\n]+)") { return $matches[1].Trim() }
         } catch { }
     }
     return $null
+}
+
+# Shared INI write logic used by both Write-RegDword and Write-RegString
+function Write-IniValue {
+    param([string]$Path, [string]$Name, [string]$Value, [string]$MatchPattern)
+
+    $section = $Path.Substring($RegRoot.Length + 1)
+    $content = try { [System.IO.File]::ReadAllText($IniPath) } catch { "" }
+    if (-not $content) { $content = "" }
+    if ($content -match "(?ms)\[$section\]") {
+        if ($content -match "(?m)^$Name$MatchPattern") { $content = $content -replace "(?m)^$Name$MatchPattern", "$Name=$Value" }
+        else { $content = $content -replace "(?m)(\[$section\])", "`$1`r`n$Name=$Value" }
+    } else {
+        $content = $content.TrimEnd() + "`r`n`r`n[$section]`r`n$Name=$Value"
+    }
+    try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch {
+        Start-Sleep -Milliseconds 200
+        try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
+    }
 }
 
 function Write-RegDword {
@@ -671,21 +721,7 @@ function Write-RegDword {
             $null = New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType DWord -Force -ErrorAction SilentlyContinue 2>&1
         } catch { }
     } else {
-        # Portable mode: write to INI instead
-        $section = $Path.Substring($RegRoot.Length + 1)
-        $content = if (Test-Path $IniPath) { Get-Content $IniPath -Raw } else { "" }
-        if (-not $content) { $content = "" }
-        if ($content -match "(?ms)\[$section\]") {
-            if ($content -match "(?m)^$Name=\d+$") { $content = $content -replace "(?m)^$Name=\d+$", "$Name=$Value" }
-            else { $content = $content -replace "(?m)(\[$section\])", "`$1`r`n$Name=$Value" }
-        } else {
-            $content = $content.TrimEnd() + "`r`n`r`n[$section]`r`n$Name=$Value"
-        }
-        try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch {
-            # Retry once if file is locked by a concurrent write
-            Start-Sleep -Milliseconds 200
-            try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
-        }
+        Write-IniValue -Path $Path -Name $Name -Value $Value -MatchPattern '=\d+$'
     }
 }
 
@@ -697,20 +733,7 @@ function Write-RegString {
             $null = New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType String -Force -ErrorAction SilentlyContinue 2>&1
         } catch { }
     } else {
-        # Portable mode: write to INI instead
-        $section = $Path.Substring($RegRoot.Length + 1)
-        $content = if (Test-Path $IniPath) { Get-Content $IniPath -Raw } else { "" }
-        if (-not $content) { $content = "" }
-        if ($content -match "(?ms)\[$section\]") {
-            if ($content -match "(?m)^$Name=.+$") { $content = $content -replace "(?m)^$Name=.+$", "$Name=$Value" }
-            else { $content = $content -replace "(?m)(\[$section\])", "`$1`r`n$Name=$Value" }
-        } else {
-            $content = $content.TrimEnd() + "`r`n`r`n[$section]`r`n$Name=$Value"
-        }
-        try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch {
-            Start-Sleep -Milliseconds 200
-            try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
-        }
+        Write-IniValue -Path $Path -Name $Name -Value $Value -MatchPattern '=.+$'
     }
 }
 
@@ -803,7 +826,7 @@ function Test-TicketFlag {
     # Portable mode: check INI
     if (Test-Path $IniPath) {
         try {
-            $raw = Get-Content $IniPath -Raw
+            $raw = [System.IO.File]::ReadAllText($IniPath)
             return ($raw -match "(?ms)\[TicketFlags\].*?^$Name=1")
         } catch { }
     }
@@ -825,7 +848,7 @@ function Set-TicketFlag {
         }
     }
     # Portable mode: write to INI
-    $content = if (Test-Path $IniPath) { Get-Content $IniPath -Raw } else { "" }
+    $content = try { [System.IO.File]::ReadAllText($IniPath) } catch { "" }
     if (-not $content) { $content = "" }
     if ($content -match "(?ms)\[TicketFlags\]") {
         if ($content -match "(?m)^$Name=\d+$") { $content = $content -replace "(?m)^$Name=\d+$", "$Name=1" }
@@ -856,12 +879,42 @@ function Clear-TicketFlag {
     }
     # Portable mode: remove from INI
     if (Test-Path $IniPath) {
-        $content = Get-Content $IniPath -Raw
+        $content = try { [System.IO.File]::ReadAllText($IniPath) } catch { "" }
         if ($content) {
             $content = $content -replace "(?m)^$Name=.*`r?`n", ""
             $content = $content -replace "`r`n`r`n\[TicketFlags\]`r`n$", ""
             try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
         }
+    }
+}
+
+# --- INI section merge helper (preserves sections not being replaced) ---
+function Merge-IniSections {
+    param(
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [Parameter(Mandatory=$true)][string[]]$SectionNames,
+        [Parameter(Mandatory=$true)][string]$NewContent
+    )
+
+    if (-not (Test-Path $FilePath)) { return Set-Content -Path $FilePath -Value $NewContent -Encoding UTF8 -Force }
+
+    $existing = [System.IO.File]::ReadAllText($FilePath)
+
+    # Strip old versions of the sections being replaced
+    foreach ($section in $SectionNames) {
+        $escaped = [regex]::Escape($section)
+        $existing = $existing -replace "(?ms)\r?\n\[$escaped\].*?(?=\r?\n\[|\z)", ""
+        $existing = $existing -replace "(?ms)^\[$escaped\].*?(?=\r?\n\[|\z)", ""
+    }
+
+    # Trim trailing whitespace, append new content
+    $existing = $existing.TrimEnd() + "`r`n`r`n$NewContent`r`n"
+
+    try {
+        Set-Content -Path $FilePath -Value $existing -Encoding UTF8 -Force -ErrorAction Stop
+    } catch {
+        Start-Sleep -Milliseconds 200
+        Set-Content -Path $FilePath -Value $existing -Encoding UTF8 -Force -ErrorAction Stop
     }
 }
 
@@ -1043,7 +1096,7 @@ $Config = @{
 # Initialize Log Path
 # =====================================================
 $LogRoot = "C:\ProgramData\ITFlow\Logs"
-New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
+$script:LogDirEnsured = $false
 
 # If GUI supplies a log path, the worker uses it so the UI can tail it live
 if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
@@ -1056,6 +1109,12 @@ function Log {
     param([string]$Message)
 
     if (-not $LogFile) { return }
+
+    # Create log directory lazily, once per session
+    if (-not $script:LogDirEnsured) {
+        $null = New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction SilentlyContinue
+        $script:LogDirEnsured = $true
+    }
 
     $line = "$(Get-Date -Format 'HH:mm:ss')  $Message"
 
@@ -1147,7 +1206,7 @@ if ([string]::IsNullOrWhiteSpace($Config.ClientId)) {
     # Fallback: read ClientId directly from the INI file (portable mode)
     if (($script:RegistryAllowed -or -not $LoadedFromRegistry) -and (Test-Path $IniPath)) {
         try {
-            $raw = Get-Content $IniPath -Raw
+            $raw = [System.IO.File]::ReadAllText($IniPath)
             if ($raw -match "(?m)^ClientId\s*=\s*(.+)$") {
                 $Config.ClientId = $matches[1].Trim()
                 Log "Config ClientId loaded from INI fallback: $($Config.ClientId)"
@@ -1595,6 +1654,10 @@ function Get-FullSnapshot {
         Storage  = $storage
         Displays = @($displays)
         Network  = $network
+
+        # Expose raw CIM objects so callers avoid re-querying
+        _CimComputerSystem    = $cs
+        _CimOperatingSystem   = $os
     }
 }
 
@@ -1920,68 +1983,35 @@ function Start-AssetEnrollment {
                 $moved = $globalLookup.data | Select-Object -First 1
                 $discoveredClientId = [int](Normalize-Value $moved.asset_client_id)
                 $discoveredAssetId  = [int](Normalize-Value $moved.asset_id)
-                Log-AssetTransferMismatch -Serial $Inv.Serial -Hostname $Inv.Hostname `
-                    -ConfiguredClientId $EffectiveClientId -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId
-                if ($AllowFollowClientTransfer -and $discoveredClientId -gt 0) {
-                    $origClientId = $EffectiveClientId
-                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
-                    $EffectiveClientId = $discoveredClientId
-                    $script:LastRunState.TransferFollowed = $true
-                    if ($AutoUpdateClientIdOnTransfer -and $EffectiveClientId -ne [int]$Config.ClientId) {
-                        Log "Auto-update enabled: persisting ClientId change $([int]$Config.ClientId) -> $EffectiveClientId"
-                        $persistOk = Set-ConfiguredClientId -NewClientId $EffectiveClientId
-                        if ($persistOk) { $script:LastRunState.ClientIdAutoUpdated = $true }
-                    }
-                    Log "Following transfer: EffectiveClientId updated to $EffectiveClientId (asset_id=$discoveredAssetId)"
-                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($Inv.Hostname) | Serial: $($Inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nNew Client ID: $EffectiveClientId`nAsset ID: $discoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
-                    $result = [pscustomobject]@{ success = "True"; data = @(@{ insert_id = $discoveredAssetId }) }
+                $followResult = Invoke-AssetTransferFollow -Inv $Inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
+                if ($followResult.Followed) {
+                    $EffectiveClientId = $followResult.DiscoveredClientId
+                    $result = [pscustomobject]@{ success = "True"; data = @(@{ insert_id = $followResult.DiscoveredAssetId }) }
                 } else {
-                    Log "WARNING: Serial '$($Inv.Serial)' exists in ITFlow under client_id=$discoveredClientId (asset_id=$discoveredAssetId). Aborting."
-                    if ($CreateTransferMismatchTicket) {
-                        $ticketTitle = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)"
-                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Configured Client ID: $EffectiveClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null
-                    }
-                $script:LastSyncOK = $false
-                return
-            }
-        } else {
-            Log "Asset not found in configured client, checking for transferred copy..."
-            $foundTransferred = $false
-            try {
-                $transferLookup = Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&asset_serial=$($inv.Serial)" $null "Transfer lookup by serial"
-                $foundTransferred = "$($transferLookup.success)" -eq "True" -and ($transferLookup.data -and $transferLookup.data.Count -gt 0)
-            } catch {
-                Log "Transfer lookup: serial not found in any client"
-            }
-            if ($foundTransferred) {
-                $moved = $transferLookup.data | Select-Object -First 1
-                $discoveredClientId = [int](Normalize-Value $moved.asset_client_id)
-                $discoveredAssetId  = [int](Normalize-Value $moved.asset_id)
-                Log-AssetTransferMismatch -Serial $inv.Serial -Hostname $inv.Hostname `
-                    -ConfiguredClientId $EffectiveClientId -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId
-                if ($AllowFollowClientTransfer -and $discoveredClientId -gt 0) {
-                    $origClientId = $EffectiveClientId
-if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -Serial $inv.Serial -Details "Original Client ID: $origClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
-                    $EffectiveClientId
-                    $script:LastRunState.TransferFollowed = $true
-                    if ($AutoUpdateClientIdOnTransfer -and $EffectiveClientId -ne [int]$Config.ClientId) {
-                        Log "Auto-update enabled: persisting ClientId change $([int]$Config.ClientId) -> $EffectiveClientId"
-                        $persistOk = Set-ConfiguredClientId -NewClientId $EffectiveClientId
-                        if ($persistOk) { $script:LastRunState.ClientIdAutoUpdated = $true }
-                    }
-                    Log "Following transfer: EffectiveClientId updated to $EffectiveClientId (asset_id=$discoveredAssetId)"
-                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($inv.Hostname) | Serial: $($inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nNew Client ID: $EffectiveClientId`nAsset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`nAuto-Update: $($AutoUpdateClientIdOnTransfer)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
-                    # Re-enter the loop with the transferred asset so rename+update can happen
-                    $lookup = [pscustomobject]@{ success = "True"; data = @($moved) }
-                } else {
-                    Log "WARNING: Serial '$($inv.Serial)' exists in ITFlow under client_id=$discoveredClientId (asset_id=$discoveredAssetId). Aborting."
-                    if ($CreateTransferMismatchTicket) {
-                        $ticketTitle = "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)"
-                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Configured Client ID: $EffectiveClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null
-                    }
                     $script:LastSyncOK = $false
                     return
                 }
+            } else {
+                Log "Asset not found in configured client, checking for transferred copy..."
+                $foundTransferred = $false
+                try {
+                    $transferLookup = Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&asset_serial=$($inv.Serial)" $null "Transfer lookup by serial"
+                    $foundTransferred = "$($transferLookup.success)" -eq "True" -and ($transferLookup.data -and $transferLookup.data.Count -gt 0)
+                } catch {
+                    Log "Transfer lookup: serial not found in any client"
+                }
+                if ($foundTransferred) {
+                    $moved = $transferLookup.data | Select-Object -First 1
+                    $discoveredClientId = [int](Normalize-Value $moved.asset_client_id)
+                    $discoveredAssetId  = [int](Normalize-Value $moved.asset_id)
+                    $followResult = Invoke-AssetTransferFollow -Inv $inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
+                    if ($followResult.Followed) {
+                        $EffectiveClientId = $followResult.DiscoveredClientId
+                        $lookup = [pscustomobject]@{ success = "True"; data = @($moved) }
+                    } else {
+                        $script:LastSyncOK = $false
+                        return
+                    }
                 } else {
                     Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $Details -DeviceSpec $DeviceSpec
                 }
@@ -2129,7 +2159,7 @@ function Run-AssetSync {
     # Snapshot-first AssetType, fallback to recompute if missing/blank
     $DetectedAssetType = $snapshot.Device.AssetType
     if ([string]::IsNullOrWhiteSpace($DetectedAssetType)) {
-        $DetectedAssetType = Get-AssetType
+        $DetectedAssetType = Get-AssetType -ComputerSystem $snapshot._CimComputerSystem -OperatingSystem $snapshot._CimOperatingSystem
         $snapshot.Device.AssetType = $DetectedAssetType
     }
     Log "Detected Asset Type: $DetectedAssetType"
@@ -2187,7 +2217,7 @@ function Run-AssetSync {
                 Log "ITFlow not reachable on attempt ${attempt}: $($_.Exception.Message)"
                 if ($attempt -lt $maxAttempts) {
                     Log "Retrying in ${sleepSeconds} seconds..."
-                    Start-CancelAwareSleep -Seconds $sleepSeconds
+                    Start-SleepCancelAware -Seconds $sleepSeconds
                 }
                 $attempt++
             }
@@ -2498,8 +2528,7 @@ function Run-AssetSync {
 
             # ===== MAC/IP WRITE-ONLY =====
             # - Do NOT read/compare from ITFlow (API does not return these fields on your instance).
-            # - Keep writes on all updates.
-            # - Trigger update if local MAC/IP changed since last successful send.
+            # - Track last-sent values locally; include MAC/IP on any update.
             $localMac = Normalize-Value $inv.MAC
             $localIp  = Normalize-Value $inv.IP
 
@@ -2509,21 +2538,14 @@ function Run-AssetSync {
             $macChanged = ($localMac -and ($localMac -ne $lastMac))
             $ipChanged  = ($localIp  -and ($localIp  -ne $lastIp))
 
-            if ($macChanged -or $ipChanged) {
+            # Include MAC/IP if they changed OR if any other field triggers an update
+            $otherChanges = ($update.Count -gt 3)
+            if ($macChanged -or $ipChanged -or $otherChanges) {
                 if ($localMac) { $update.asset_mac = $inv.MAC }
                 if ($localIp)  { $update.asset_ip  = $inv.IP  }
             }
 
-            # If any other field change triggers update, always include MAC/IP as well (when present)
-            $baseKeyCount = 3
-            $hasOtherChanges = ($update.Count -gt $baseKeyCount)
-
-            if ($hasOtherChanges) {
-                if ($localMac -and -not ($update.Keys -contains "asset_mac")) { $update.asset_mac = $inv.MAC }
-                if ($localIp  -and -not ($update.Keys -contains "asset_ip"))  { $update.asset_ip  = $inv.IP  }
-            }
-
-            if ($update.Count -gt $baseKeyCount) {
+            if ($update.Count -gt 3) {
                 $resp = Invoke-ITFlow POST "$($Config.BaseUrl)/api/v1/assets/update.php" $update
                 Log ("Asset update API response: " + ($resp | ConvertTo-Json -Depth 4 -Compress))
 
@@ -2558,32 +2580,13 @@ function Run-AssetSync {
             $moved = $transferLookup.data | Select-Object -First 1
             $discoveredClientId = [int](Normalize-Value $moved.asset_client_id)
             $discoveredAssetId  = [int](Normalize-Value $moved.asset_id)
-            Log-AssetTransferMismatch -Serial $inv.Serial -Hostname $inv.Hostname `
-                -ConfiguredClientId $EffectiveClientId -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId
-            if ($AllowFollowClientTransfer -and $discoveredClientId -gt 0) {
-                $origClientId = $EffectiveClientId
-if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
-                $EffectiveClientId = $discoveredClientId
-                $script:LastRunState.TransferFollowed = $true
-                if ($AutoUpdateClientIdOnTransfer -and $EffectiveClientId -ne [int]$Config.ClientId) {
-                    Log "Auto-update enabled: persisting ClientId change $([int]$Config.ClientId) -> $EffectiveClientId"
-                    $persistOk = Set-ConfiguredClientId -NewClientId $EffectiveClientId
-                    if ($persistOk) { $script:LastRunState.ClientIdAutoUpdated = $true }
-                }
-                Log "Following transfer: EffectiveClientId updated to $EffectiveClientId (asset_id=$discoveredAssetId)"
-                if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($inv.Hostname) | Serial: $($inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nNew Client ID: $EffectiveClientId`nAsset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
+            $followResult = Invoke-AssetTransferFollow -Inv $inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
+            if ($followResult.Followed) {
+                $EffectiveClientId = $followResult.DiscoveredClientId
                 $asset = $moved
-                $script:CurrentAssetId = [int]$asset.asset_id
-                Log "Transfer lookup succeeded, asset_id=$script:CurrentAssetId"
-                # Re-enter the loop with the transferred asset so rename+update can happen
                 $lookup = [pscustomobject]@{ success = "True"; data = @($asset) }
                 $retrySyncAfterTransfer = $true
             } else {
-                Log "WARNING: Serial '$($inv.Serial)' exists in ITFlow under client_id=$discoveredClientId (asset_id=$discoveredAssetId). Aborting."
-                if ($CreateTransferMismatchTicket) {
-                    $ticketTitle = "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)"
-                    Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Configured Client ID: $EffectiveClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null
-                }
                 $script:LastSyncOK = $false
                 return
             }
@@ -2611,7 +2614,7 @@ if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $(
 
     # Sync AD computer attributes (works when running as SYSTEM via scheduled task)
     try {
-        Sync-ADComputerAttributes -Snapshot $snapshot -DeviceSpec $DeviceSpec -LastCheckIn $lastCheckIn
+        Sync-ADComputerAttributes -Snapshot $snapshot -DeviceSpec $DeviceSpec -LastCheckIn $lastCheckIn -ComputerSystem $snapshot._CimComputerSystem
     } catch {
         Log "Sync-ADComputerAttributes threw (non-fatal): $($_.Exception.Message)"
     }
@@ -2876,13 +2879,12 @@ $btnInstall.Width = 100
 $btnInstall.Height = 32
 $headerLeftFlow.Controls.Add($btnInstall)
 
+$script:IsInstalled = $false
+
 function Update-InstallButton {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($task) {
-        $btnInstall.Text = "Uninstall"
-    } else {
-        $btnInstall.Text = "Install"
-    }
+    $script:IsInstalled = [bool]$task
+    $btnInstall.Text = if ($script:IsInstalled) { "Uninstall" } else { "Install" }
 }
 
 $btnSysinfoOpen = New-Object Windows.Forms.Button
@@ -3732,7 +3734,7 @@ $btnDefaults.Add_Click({
     )
     if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
         if (Test-Path $IniPath) {
-            $content = Get-Content $IniPath -Raw
+            $content = [System.IO.File]::ReadAllText($IniPath)
             # Keep only the [ITFlow] section (strip everything after it)
             if ($content -match "(?ms)\[ITFlow\].*?(\r?\n\r?\n\[|\z)") {
                 $keep = $matches[0]
@@ -3762,34 +3764,20 @@ $btnSave.Add_Click({
         $EnableRenameFailureTicketing = $script:EnableTicketingGui
 
         $enc = Protect-String $Config.ApiKey
-        # Write preferences to INI for portable mode fallback
-        $prefsSection = @"
+        # Write preferences to INI for portable mode fallback (merge, never destroy)
+        $newIniContent = @"
+[ITFlow]
+BaseUrl=$($Config.BaseUrl)
+ClientId=$($Config.ClientId)
+ApiKey=$enc
+
 [Preferences]
 CreateTicketsGui=$(if ($script:EnableTicketingGui) { 1 } else { 0 })
 FollowClientTransfers=$(if ($script:AllowFollowClientTransfer) { 1 } else { 0 })
 AutoUpdateClientIdOnTransfer=$(if ($script:AutoUpdateClientIdOnTransfer) { 1 } else { 0 })
 "@
-@"
-[ITFlow]
-BaseUrl=$($Config.BaseUrl)
-ClientId=$($Config.ClientId)
-ApiKey=$enc
-
-$prefsSection
-"@
-        $iniText = @"
-[ITFlow]
-BaseUrl=$($Config.BaseUrl)
-ClientId=$($Config.ClientId)
-ApiKey=$enc
-
-$prefsSection
-"@
-        try { Set-Content -Path $IniPath -Value $iniText -Encoding UTF8 -Force -ErrorAction Stop } catch {
-            Start-Sleep -Milliseconds 200
-            try { Set-Content -Path $IniPath -Value $iniText -Encoding UTF8 -Force -ErrorAction Stop } catch {
-                Log "WARN: INI write failed (file locked), config changes saved to memory only"
-            }
+        try { Merge-IniSections -FilePath $IniPath -SectionNames @('ITFlow', 'Preferences') -NewContent $newIniContent } catch {
+            Log "WARN: INI merge failed (file locked), config changes saved to memory only: $($_.Exception.Message)"
         }
 
         Log "Config saved (GUI ticketing=$($script:EnableTicketingGui); followTransfers=$AllowFollowClientTransfer; autoUpdateClientId=$AutoUpdateClientIdOnTransfer)"
@@ -3828,7 +3816,7 @@ $btnInstall.Add_Click({
         return
     }
 
-    if ($btnInstall.Text -eq "Uninstall") {
+    if ($script:IsInstalled) {
         # --- Uninstall ---
         try { Uninstall-ITFlowScheduledTask } catch { }
         try { Remove-Item -LiteralPath $RegRoot -Recurse -Force -ErrorAction Stop; Log "Registry keys removed" } catch { Log "Registry cleanup: $($_.Exception.Message)" }
