@@ -1,6 +1,6 @@
-# =====================================================
+﻿# =====================================================
 # ITFlow PowerShell Agent
-# version - 7.1
+# version - 7.4.2
 # PowerShell 5.1 Compatible
 # =====================================================
 
@@ -10,7 +10,7 @@ param(
 
     # NEW: internal worker-mode for background runspace execution
     [switch]$Worker,
-
+a
     # NEW: allow the GUI to force the worker to use the same log file
     [string]$LogPath,
 
@@ -38,12 +38,12 @@ $AllowUserInteraction = (-not $IsHeadlessExecution) -and (-not $script:IsWorkerR
 #===============================
 
 # Agent version
-$AgentVersion = "7.1"
+$AgentVersion = "7.4.2"
 
 # Current asset context for ticket linking (set during sync runs)
 $script:CurrentAssetId = $null
 
-# Ticketing feature switches — overridden by GUI preference or registry
+# Ticketing feature switches - overridden by GUI preference or registry
 $EnableTicketingSilent = $true
 $EnableTicketingGui    = $true
 $DefaultAssetStatus    = "Deployed"
@@ -313,6 +313,7 @@ function Test-ITFlowDuplicateAssetName {
                     IsDuplicate = $true
                     Count       = $resp.count
                     OtherAssetIds = ($others | ForEach-Object { [int]$_.asset_id })
+                    OtherAssetSerials = ($others | ForEach-Object { [string]$_.serial })
                 }
             }
         }
@@ -348,19 +349,134 @@ function Test-ADComputerNameExists {
         $root = "LDAP://$domain"
         $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$root)
         $searcher.Filter = "(&(objectCategory=computer)(sAMAccountName=$DesiredHostname`$))"
-        $searcher.PropertiesToLoad.Add("distinguishedName") | Out-Null
+        $searcher.PropertiesToLoad.AddRange(@("distinguishedName", "serialNumber")) | Out-Null
         $result = $searcher.FindOne()
 
         if ($result -and $result.Properties["distinguishedname"]) {
             $dn = $result.Properties["distinguishedname"][0]
-            return [pscustomobject]@{ IsDomainJoined = $true; Exists = $true; ExistingDN = $dn }
+            $existingSerial = if ($result.Properties.serialnumber) { $result.Properties.serialnumber[0] } else { "" }
+            return [pscustomobject]@{ IsDomainJoined = $true; Exists = $true; ExistingDN = $dn; ExistingSerial = $existingSerial }
         }
 
-        return [pscustomobject]@{ IsDomainJoined = $true; Exists = $false; ExistingDN = $null }
+        return [pscustomobject]@{ IsDomainJoined = $true; Exists = $false; ExistingDN = $null; ExistingSerial = "" }
     }
     catch {
         Log "AD check unavailable (ignored): $($_.Exception.Message)"
-        return [pscustomobject]@{ IsDomainJoined = $true; Exists = $false; ExistingDN = $null; ADCheckFailed = $true }
+        return [pscustomobject]@{ IsDomainJoined = $true; Exists = $false; ExistingDN = $null; ADCheckFailed = $true; ExistingSerial = "" }
+    }
+}
+
+# =====================================================
+# AD Computer Attribute Sync Helper
+# =====================================================
+function Sync-ADComputerAttributes {
+    param(
+        [Parameter(Mandatory=$true)]$Snapshot,
+        [string]$DeviceSpec = "",
+        [string]$LastCheckIn = ""
+    )
+
+    # Only attempt on domain-joined machines
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        if (-not $cs.PartOfDomain) { Log "AD attribute sync skipped: not domain-joined"; return }
+    } catch { return }
+
+    try {
+        $domain = ([System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()).Name
+        $root = "LDAP://$domain"
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$root)
+        $searcher.Filter = "(&(objectCategory=computer)(sAMAccountName=$env:COMPUTERNAME`$))"
+        $searcher.PropertiesToLoad.AddRange(@("distinguishedName", "serialNumber", "description", "info"))
+        $result = $searcher.FindOne()
+
+        if (-not $result) {
+            Log "AD attribute sync skipped: computer object not found"
+            return
+        }
+
+        $computer = [ADSI]$result.Path
+
+        # 1) serialNumber (try individually - not all schemas allow this on computer objects)
+        $serial = $Snapshot.Device.Serial
+        $currentSerial = if ($result.Properties.serialnumber) { $result.Properties.serialnumber[0] } else { "" }
+        if ($currentSerial -ne $serial) {
+            try {
+                $computer.Put("serialNumber", $serial)
+                $computer.SetInfo()
+                Log "AD serialNumber: '$currentSerial' -> '$serial'"
+            } catch {
+                Log "AD serialNumber write skipped (non-fatal): $($_.Exception.Message)"
+            }
+        }
+
+        # 2) description - compact summary string
+        $parts = @()
+        $parts += "$($Snapshot.Device.Make) $($Snapshot.Device.Model)"
+        if ($Snapshot.CPU) { $parts += "$($Snapshot.CPU.Name)" }
+        if ($Snapshot.Memory -and $Snapshot.Memory.TotalGB) { $parts += "$($Snapshot.Memory.TotalGB) GB RAM" }
+        if ($Snapshot.Storage -and $Snapshot.Storage.Totals -and $Snapshot.Storage.Totals.PhysicalTotalGB) {
+            $parts += "$($Snapshot.Storage.Totals.PhysicalTotalGB) GB Storage"
+        }
+        $parts += "$($Snapshot.Device.OS)"
+        $description = $parts -join " | "
+
+        $currentDesc = if ($result.Properties.description) { $result.Properties.description[0] } else { "" }
+        if ($currentDesc -ne $description) {
+            try {
+                $computer.Put("description", $description)
+                $computer.SetInfo()
+                Log "AD description: '$currentDesc' -> '$description'"
+            } catch {
+                Log "AD description write failed (non-fatal): $($_.Exception.Message)"
+            }
+        }
+
+        # 3) info (Notes) - full device specification block
+        if ($DeviceSpec) {
+            $infoValue = $DeviceSpec
+            if ($LastCheckIn) { $infoValue += "`r`n`r`nLast Check-In: $LastCheckIn" }
+            $currentInfo = if ($result.Properties.info) { $result.Properties.info[0] } else { "" }
+            if ($currentInfo -ne $infoValue) {
+                try {
+                    $computer.Put("info", $infoValue)
+                    $computer.SetInfo()
+                    Log "AD info (Notes) updated with check-in timestamp"
+                } catch {
+                    Log "AD info write failed (non-fatal): $($_.Exception.Message)"
+                }
+            }
+        }
+    } catch {
+        Log "AD attribute sync failed (non-fatal): $($_.Exception.Message)"
+    }
+}
+
+
+# =====================================================
+# Device Report Ticket (GPO-triggered)
+# =====================================================
+function Invoke-DeviceReportCheck {
+    param(
+        [Parameter(Mandatory=$true)][string]$Hostname,
+        [Parameter(Mandatory=$true)][string]$Serial,
+        [Parameter(Mandatory=$true)][int]$ClientId,
+        [Parameter(Mandatory=$true)][string]$DeviceSpec
+    )
+
+    $regPath = "$RegRoot\TicketFlags"
+    $regName = "DeviceReport"
+    $triggered = $false
+    try {
+        $val = (Get-ItemProperty -LiteralPath $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
+        if ($val -eq 0) { $triggered = $true }
+    } catch { }
+
+    if ($triggered) {
+        $title = "[DEVICE REPORT] $Hostname | Serial: $Serial"
+        Create-ITFlowTicket -Title $title -ClientId $ClientId -Serial $Serial -Details $DeviceSpec | Out-Null
+        Set-TicketFlag $regName | Out-Null
+        Log "Device report ticket created for '$Serial'"
     }
 }
 
@@ -1012,7 +1128,7 @@ Invoke-RegistryMigration
 # or the current user doesn't have admin rights to write to it
 $script:RegistryAllowed = (Test-Path $RegRoot) -and (Test-IsAdmin)
 if (-not $script:RegistryAllowed -and (Test-IsAdmin)) {
-    # Admin but no registry key yet — create it so this session and future runs use registry
+    # Admin but no registry key yet - create it so this session and future runs use registry
     try {
         if (-not (Test-Path $RegRoot)) { $null = New-Item -Path $RegRoot -Force -ErrorAction Stop }
         if (-not (Test-Path $RegState)) { $null = New-Item -Path $RegState -Force -ErrorAction Stop }
@@ -1599,7 +1715,10 @@ function Create-ITFlowTicket {
         [Nullable[int]]$AssetId = $null,
 
         # Optional: pass serial to resolve asset id if needed
-        [string]$Serial = $null
+        [string]$Serial = $null,
+
+        # Optional: ticket body text (ticket_details)
+        [string]$Details = ""
     )
 
     # Base payload
@@ -1607,6 +1726,13 @@ function Create-ITFlowTicket {
         api_key        = $Config.ApiKey
         client_id      = $ClientId
         ticket_subject = $Title
+    }
+
+    # Include ticket_details when provided (convert plaintext to HTML for web display)
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        $htmlDetails = $Details -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
+        $htmlDetails = $htmlDetails -replace "`r`n", "<br>" -replace "`n", "<br>"
+        $payload.ticket_details = $htmlDetails
     }
 
     # Determine best asset_id to attach (in order of preference)
@@ -1745,7 +1871,7 @@ function Invoke-HostnameRenameSafe {
             if (-not (Test-TicketFlag $renameFailFlag)) {
                 $ticketTitle = "[RENAME FAILED] $($env:COMPUTERNAME) -> $DesiredHostname | Serial: $($inv.Serial) | Error: $($_.Exception.Message)"
                 try { $assetIdForTicket = $script:CurrentAssetId } catch { $assetIdForTicket = $null }
-                Create-ITFlowTicket -Title $ticketTitle -ClientId $Config.ClientId -AssetId $assetIdForTicket | Out-Null
+                Create-ITFlowTicket -Title $ticketTitle -ClientId $Config.ClientId -AssetId $assetIdForTicket -Details "Current Hostname: $($env:COMPUTERNAME)`nDesired Hostname: $DesiredHostname`nSerial: $($inv.Serial)`nError: $($_.Exception.Message)" | Out-Null
                 Set-TicketFlag $renameFailFlag | Out-Null
             }
         }
@@ -1760,7 +1886,13 @@ function Start-AssetEnrollment {
     param(
         [pscustomobject]$Inv,
         [string]$DetectedAssetType,
-        [int]$EffectiveClientId
+        [int]$EffectiveClientId,
+
+        # Enrollment ticket body (built from full snapshot in Run-AssetSync)
+        [string]$Details = "",
+
+        # Device specification block (appended to transfer tickets for forensic record)
+        [string]$DeviceSpec = ""
     )
 
     Log "Enrollment (create): no existing asset found for serial '$($Inv.Serial)' - creating new asset in client_id=$EffectiveClientId"
@@ -1792,7 +1924,7 @@ function Start-AssetEnrollment {
                     -ConfiguredClientId $EffectiveClientId -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId
                 if ($AllowFollowClientTransfer -and $discoveredClientId -gt 0) {
                     $origClientId = $EffectiveClientId
-                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -Serial $Inv.Serial | Out-Null }
+                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
                     $EffectiveClientId = $discoveredClientId
                     $script:LastRunState.TransferFollowed = $true
                     if ($AutoUpdateClientIdOnTransfer -and $EffectiveClientId -ne [int]$Config.ClientId) {
@@ -1801,13 +1933,13 @@ function Start-AssetEnrollment {
                         if ($persistOk) { $script:LastRunState.ClientIdAutoUpdated = $true }
                     }
                     Log "Following transfer: EffectiveClientId updated to $EffectiveClientId (asset_id=$discoveredAssetId)"
-                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($Inv.Hostname) | Serial: $($Inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId | Out-Null }
+                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($Inv.Hostname) | Serial: $($Inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nNew Client ID: $EffectiveClientId`nAsset ID: $discoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
                     $result = [pscustomobject]@{ success = "True"; data = @(@{ insert_id = $discoveredAssetId }) }
                 } else {
                     Log "WARNING: Serial '$($Inv.Serial)' exists in ITFlow under client_id=$discoveredClientId (asset_id=$discoveredAssetId). Aborting."
                     if ($CreateTransferMismatchTicket) {
                         $ticketTitle = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)"
-                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $Inv.Serial | Out-Null
+                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Configured Client ID: $EffectiveClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null
                     }
                 $script:LastSyncOK = $false
                 return
@@ -1829,8 +1961,8 @@ function Start-AssetEnrollment {
                     -ConfiguredClientId $EffectiveClientId -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId
                 if ($AllowFollowClientTransfer -and $discoveredClientId -gt 0) {
                     $origClientId = $EffectiveClientId
-                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -Serial $inv.Serial | Out-Null }
-                    $EffectiveClientId = $discoveredClientId
+if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -Serial $inv.Serial -Details "Original Client ID: $origClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
+                    $EffectiveClientId
                     $script:LastRunState.TransferFollowed = $true
                     if ($AutoUpdateClientIdOnTransfer -and $EffectiveClientId -ne [int]$Config.ClientId) {
                         Log "Auto-update enabled: persisting ClientId change $([int]$Config.ClientId) -> $EffectiveClientId"
@@ -1838,20 +1970,20 @@ function Start-AssetEnrollment {
                         if ($persistOk) { $script:LastRunState.ClientIdAutoUpdated = $true }
                     }
                     Log "Following transfer: EffectiveClientId updated to $EffectiveClientId (asset_id=$discoveredAssetId)"
-                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($inv.Hostname) | Serial: $($inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId | Out-Null }
+                    if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($inv.Hostname) | Serial: $($inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nNew Client ID: $EffectiveClientId`nAsset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`nAuto-Update: $($AutoUpdateClientIdOnTransfer)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
                     # Re-enter the loop with the transferred asset so rename+update can happen
                     $lookup = [pscustomobject]@{ success = "True"; data = @($moved) }
                 } else {
                     Log "WARNING: Serial '$($inv.Serial)' exists in ITFlow under client_id=$discoveredClientId (asset_id=$discoveredAssetId). Aborting."
                     if ($CreateTransferMismatchTicket) {
                         $ticketTitle = "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)"
-                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $inv.Serial | Out-Null
+                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Configured Client ID: $EffectiveClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null
                     }
                     $script:LastSyncOK = $false
                     return
                 }
                 } else {
-                    Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId
+                    Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $Details -DeviceSpec $DeviceSpec
                 }
             }
         } catch {
@@ -1878,7 +2010,7 @@ function Start-AssetEnrollment {
     if ((($Silent -and $EnableTicketingSilent) -or (-not $Silent -and $EnableTicketingGui))) {
         if (-not (Test-TicketFlag "Enrollment")) {
             $ticketTitle = "[ENROLL] $($Inv.Hostname) | Serial: $($Inv.Serial) | $($Inv.OS)"
-            Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $Inv.Serial | Out-Null
+            Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $Inv.Serial -Details $Details | Out-Null
             Set-TicketFlag "Enrollment" | Out-Null
         } else {
             Log "Enrollment ticket already created - skipping"
@@ -1898,8 +2030,6 @@ function Run-AssetSync {
         # Reset per-run guard (prevents duplicate compare logging)
         $script:LoggedLocalVsITFlow = $false
         # Reset per run to prevent GUI session bleed
-        $script:SetAssetNameOnce = $false
-
         # --- Cancellation checkpoint (Added) ---
         Throw-IfCancelRequested
 
@@ -1907,6 +2037,78 @@ function Run-AssetSync {
     # 1) Interrogate Machine (once)
     # =============================
     $snapshot = Get-FullSnapshot -AgentVersion $AgentVersion
+
+    # Build device specification block for tickets (preserved when asset is archived/deleted)
+    $dsb = New-Object System.Text.StringBuilder
+    if ($snapshot.CPU) {
+        $null = $dsb.AppendLine("CPU")
+        $null = $dsb.AppendLine("---")
+        $null = $dsb.AppendLine("Name:       $($snapshot.CPU.Name)")
+        $null = $dsb.AppendLine("Cores:      $($snapshot.CPU.CoreCount) / $($snapshot.CPU.LogicalCount)")
+        $null = $dsb.AppendLine("Max MHz:    $($snapshot.CPU.MaxClockMHz)")
+    }
+    if ($snapshot.Memory -and $snapshot.Memory.TotalGB) {
+        $null = $dsb.AppendLine("")
+        $null = $dsb.AppendLine("Memory")
+        $null = $dsb.AppendLine("------")
+        $null = $dsb.AppendLine("Total GB:   $($snapshot.Memory.TotalGB)")
+    }
+    if ($snapshot.Storage -and $snapshot.Storage.Totals) {
+        $null = $dsb.AppendLine("")
+        $null = $dsb.AppendLine("Storage")
+        $null = $dsb.AppendLine("-------")
+        $null = $dsb.AppendLine("Physical:   $($snapshot.Storage.Totals.PhysicalTotalGB) GB")
+        $null = $dsb.AppendLine("Volumes:    $($snapshot.Storage.Totals.VolumeTotalGB) GB")
+        if ($snapshot.Storage.PhysicalDisks -and $snapshot.Storage.PhysicalDisks.Count -gt 0) {
+            $null = $dsb.AppendLine("Disks:      $($snapshot.Storage.PhysicalDisks.Count)")
+            foreach ($disk in $snapshot.Storage.PhysicalDisks) {
+                $null = $dsb.AppendLine("")
+                $null = $dsb.AppendLine("  Model:      $($disk.Model)")
+                if ($disk.Serial) { $null = $dsb.AppendLine("  Serial:     $($disk.Serial)") }
+                $null = $dsb.AppendLine("  Size:       $([math]::Round($disk.SizeBytes / 1GB, 2)) GB")
+                $null = $dsb.AppendLine("  Media:      $($disk.MediaType)")
+                if ($disk.HealthStatus) { $null = $dsb.AppendLine("  Health:     $($disk.HealthStatus)") }
+            }
+        }
+    }
+    if ($snapshot.Displays -and $snapshot.Displays.Count -gt 0) {
+        $null = $dsb.AppendLine("")
+        $null = $dsb.AppendLine("Displays")
+        $null = $dsb.AppendLine("--------")
+        foreach ($display in $snapshot.Displays) {
+            $null = $dsb.AppendLine("")
+            if ($display.FriendlyName) { $null = $dsb.AppendLine("  Name:       $($display.FriendlyName)") }
+            if ($display.Manufacturer) { $null = $dsb.AppendLine("  Make:       $($display.Manufacturer)") }
+            if ($display.Model) { $null = $dsb.AppendLine("  Model:      $($display.Model)") }
+            if ($display.Serial) { $null = $dsb.AppendLine("  Serial:     $($display.Serial)") }
+            if ($display.SizeInches) { $null = $dsb.AppendLine("  Size:       $($display.SizeInches) inches") }
+            if ($display.NativeResolution) {
+                $null = $dsb.AppendLine("  Resolution: $($display.NativeResolution.Width) x $($display.NativeResolution.Height)")
+            }
+        }
+    }
+    if ($snapshot.Network -and $snapshot.Network.Adapters) {
+        $null = $dsb.AppendLine("")
+        $null = $dsb.AppendLine("Network")
+        $null = $dsb.AppendLine("-------")
+        foreach ($adapter in $snapshot.Network.Adapters) {
+            $null = $dsb.AppendLine("")
+            $null = $dsb.AppendLine("  Name:       $($adapter.Name)")
+            if ($adapter.InterfaceDescription -and $adapter.InterfaceDescription -ne $adapter.Name) {
+                $null = $dsb.AppendLine("  Desc:       $($adapter.InterfaceDescription)")
+            }
+            $null = $dsb.AppendLine("  Status:     $($adapter.Status)")
+            $null = $dsb.AppendLine("  MAC:        $($adapter.MacAddress)")
+            if ($adapter.LinkSpeed) { $null = $dsb.AppendLine("  Speed:      $($adapter.LinkSpeed)") }
+            if ($adapter.Ips -and $adapter.Ips.Count -gt 0) {
+                foreach ($ip in $adapter.Ips) {
+                    $null = $dsb.AppendLine("  IP:         $($ip.IPAddress) /$($ip.PrefixLength) ($($ip.AddressFamily))")
+                    if ($ip.DefaultGateway) { $null = $dsb.AppendLine("  Gateway:    $($ip.DefaultGateway)") }
+                }
+            }
+        }
+    }
+    $DeviceSpec = $dsb.ToString()
 
     # Keep existing variables for minimal downstream code changes
     $inv = [pscustomobject]@{
@@ -2070,7 +2272,8 @@ function Run-AssetSync {
 
                     Log "Hostname mismatch: $($env:COMPUTERNAME) -> $DesiredHostname"
 
-                
+                    $adCleanupLog = ""
+
                     Set-StateDword -Name 'LastRenameRequired' -Value 1
                     Set-StateString -Name 'LastTargetHostname' -Value $DesiredHostname
                     # -----------------------------------------
@@ -2079,28 +2282,44 @@ function Run-AssetSync {
                     $renameConflictFlag = "RenameConflict_$DesiredHostname"
 
                     # Auto-clear previous RenameFailed flag for this target (conditions may have changed since last attempt)
-                    if (Test-TicketFlag "RenameFailed_$DesiredHostname") {
-                        Log "Auto-clearing previous RenameFailed flag for '$DesiredHostname' (re-attempting)"
+                    $renameRetryCount = [int](Get-AgentCacheValue -Name "RenameRetry_$DesiredHostname" -Default 0)
+                    if ($renameRetryCount -ge 3) {
+                        Log "Rename retry limit reached for '$DesiredHostname' ($renameRetryCount attempts) - giving up"
+                    } elseif (Test-TicketFlag "RenameFailed_$DesiredHostname") {
+                        $renameRetryCount++
+                        Set-AgentCacheValue -Name "RenameRetry_$DesiredHostname" -Value $renameRetryCount
+                        Log "Auto-clearing previous RenameFailed flag for '$DesiredHostname' (re-attempting, attempt $renameRetryCount)"
                         Clear-TicketFlag "RenameFailed_$DesiredHostname"
                     }
 
                     # 1) ITFlow duplicate-name guard
+                    $dup_check_serial = $snapshot.Device.Serial
                     if ($EnableRenamePreflightITFlowDupCheck) {
                         $dup = Test-ITFlowDuplicateAssetName -DesiredHostname $DesiredHostname -EffectiveClientId $EffectiveClientId -CurrentAssetId ([int]$asset.asset_id)
                         if ($dup.IsDuplicate) {
-                            Log "RENAME BLOCKED: ITFlow duplicate asset_name='$DesiredHostname' found. Other asset_ids: $($dup.OtherAssetIds -join ', ')"
-
-                            Clear-QueuedRename
-
-                            if (-not (Test-TicketFlag $renameConflictFlag)) {
-                                $ticketTitle = "[RENAME CONFLICT] Duplicate ITFlow asset_name '$DesiredHostname' detected. Current asset_id=$($asset.asset_id). Others: $($dup.OtherAssetIds -join ', ') | Serial: $($inv.Serial)"
-                                Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$asset.asset_id) | Out-Null
-                                Set-TicketFlag $renameConflictFlag | Out-Null
+                            $serialMatch = ($dup.OtherAssetSerials | Where-Object { $_ -eq $dup_check_serial }) -ne $null
+                            if ($serialMatch) {
+                                Log "ITFlow duplicate asset_name='$DesiredHostname' found but serial matches ($dup_check_serial) - reimage scenario, proceeding with rename"
                             } else {
-                                Log "Rename conflict ticket already raised for '$DesiredHostname' - skipping"
-                            }
+                                $otherIdsStr = $dup.OtherAssetIds -join ', '
+                                Log "RENAME BLOCKED: ITFlow duplicate asset_name='$DesiredHostname' found. Other asset_ids: $otherIdsStr. Serials do not match local device serial ($dup_check_serial)"
 
-                            return
+                                Clear-QueuedRename
+
+                                if (-not (Test-TicketFlag $renameConflictFlag)) {
+                                    $currentAssetId = $asset.asset_id
+                                    $currentSerial = $inv.Serial
+                                    $currentHostname = $env:COMPUTERNAME
+                                    $ticketTitle = "[RENAME CONFLICT] Duplicate ITFlow asset_name '$DesiredHostname' detected. Current asset_id=$currentAssetId. Others: $otherIdsStr | Serial: $currentSerial"
+                                    $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nCurrent Asset ID: $currentAssetId`nConflicting Asset IDs: $otherIdsStr"
+                                    Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$currentAssetId) -Details $detailStr | Out-Null
+                                    Set-TicketFlag $renameConflictFlag | Out-Null
+                                } else {
+                                    Log "Rename conflict ticket already raised for '$DesiredHostname' - skipping"
+                                }
+
+                                return
+                            }
                         }
                     }
 
@@ -2108,19 +2327,50 @@ function Run-AssetSync {
                     if ($EnableRenamePreflightADCheck) {
                         $ad = Test-ADComputerNameExists -DesiredHostname $DesiredHostname
                         if ($ad.IsDomainJoined -and $ad.Exists) {
-                            Log "RENAME BLOCKED: AD computer account already exists for '$DesiredHostname' (DN='$($ad.ExistingDN)')"
-
-                            Clear-QueuedRename
-
-                            if (-not (Test-TicketFlag $renameConflictFlag)) {
-                                $ticketTitle = "[RENAME CONFLICT] AD computer account already exists for '$DesiredHostname'. Rename blocked. DN='$($ad.ExistingDN)' | Serial: $($inv.Serial)"
-                                Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$asset.asset_id) | Out-Null
-                                Set-TicketFlag $renameConflictFlag | Out-Null
+                            if ($ad.ExistingSerial -and $ad.ExistingSerial -eq $dup_check_serial) {
+                                Log "AD computer account already exists for '$DesiredHostname' but serial matches ($dup_check_serial) - reimage scenario, attempting cleanup"
+                                try {
+                                    $dnParts = $ad.ExistingDN -split ','
+                                    $cn = $dnParts[0] -replace '^CN='
+                                    $parentDN = ($dnParts[1..($dnParts.Length - 1)] -join ',')
+                                    $parent = [ADSI]"LDAP://$parentDN"
+                                    $parent.Delete("computer", "CN=$cn")
+                                    $adCleanupLog = "Old AD account '$($ad.ExistingDN)' deleted"
+                                    Log "AD old computer account deleted: $($ad.ExistingDN)"
+                                } catch {
+                                    Log "AD old computer account delete failed (non-fatal): $($_.Exception.Message)"
+                                    try {
+                                        $oldComputer = [ADSI]"LDAP://$($ad.ExistingDN)"
+                                        $oldComputer.Put("userAccountControl", 4096)
+                                        $oldComputer.SetInfo()
+                                        $adCleanupLog = "Old AD account '$($ad.ExistingDN)' disabled (delete not permitted)"
+                                        Log "AD old computer account disabled: $($ad.ExistingDN)"
+                                    } catch {
+                                        $adCleanupLog = "Old AD account '$($ad.ExistingDN)' could not be cleaned up - manual intervention required"
+                                        Log "AD old computer account cleanup failed entirely: $($_.Exception.Message)"
+                                    }
+                                }
                             } else {
-                                Log "Rename conflict ticket already raised for '$DesiredHostname' - skipping"
-                            }
+                                $adDN = $ad.ExistingDN
+                                $adSerial = $ad.ExistingSerial
+                                Log "RENAME BLOCKED: AD computer account already exists for '$DesiredHostname' (DN='$adDN'). AD serial='$adSerial' does not match local device serial ($dup_check_serial)"
 
-                            return
+                                Clear-QueuedRename
+
+                                if (-not (Test-TicketFlag $renameConflictFlag)) {
+                                    $currentHostname = $env:COMPUTERNAME
+                                    $currentSerial = $inv.Serial
+                                    $currentAssetId = $asset.asset_id
+                                    $ticketTitle = "[RENAME CONFLICT] AD computer account already exists for '$DesiredHostname'. Rename blocked. DN='$adDN' | Serial: $currentSerial"
+                                    $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nCurrent Asset ID: $currentAssetId`nAD DN: $adDN"
+                                    Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$currentAssetId) -Details $detailStr | Out-Null
+                                    Set-TicketFlag $renameConflictFlag | Out-Null
+                                } else {
+                                    Log "Rename conflict ticket already raised for '$DesiredHostname' - skipping"
+                                }
+
+                                return
+                            }
                         }
                     }
 
@@ -2137,6 +2387,9 @@ function Run-AssetSync {
                         }
                     }
 
+                    $currentHostname = $env:COMPUTERNAME
+                    $currentSerial = $inv.Serial
+                    $currentAssetId = $asset.asset_id
                     if ($AllowUserInteraction) {
         # UI prompts MUST occur after sync completes (UI thread).
         Log "Interactive context: queuing hostname rename to '$DesiredHostname' for post-sync prompt."
@@ -2146,8 +2399,10 @@ function Run-AssetSync {
         Set-StateString -Name "LastTargetHostname" -Value $DesiredHostname
         if ($EnableTicketingGui) {
             if (-not (Test-TicketFlag $renameFlag)) {
-                $ticketTitle = "[RENAME] $($env:COMPUTERNAME) -> $DesiredHostname | Serial: $($inv.Serial)"
-                Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$asset.asset_id) | Out-Null
+                $ticketTitle = "[RENAME] $currentHostname -> $DesiredHostname | Serial: $currentSerial"
+                $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nMode: GUI"
+                if ($adCleanupLog) { $detailStr += "`nAD Cleanup: $adCleanupLog" }
+                Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$currentAssetId) -Details $detailStr | Out-Null
                 Set-TicketFlag $renameFlag | Out-Null
             } else {
                 Log "Rename ticket already raised for '$DesiredHostname' - skipping"
@@ -2164,8 +2419,10 @@ function Run-AssetSync {
             } else {
                 if ($EnableTicketingSilent) {
                     if (-not (Test-TicketFlag $renameFlag)) {
-                        $ticketTitle = "[RENAME] $($env:COMPUTERNAME) -> $DesiredHostname | Serial: $($inv.Serial)"
-                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $inv.Serial | Out-Null
+                        $ticketTitle = "[RENAME] $currentHostname -> $DesiredHostname | Serial: $currentSerial"
+                        $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nMode: Headless"
+                        if ($adCleanupLog) { $detailStr += "`nAD Cleanup: $adCleanupLog" }
+                        Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $inv.Serial -Details $detailStr | Out-Null
                         Set-TicketFlag $renameFlag | Out-Null
                     } else {
                         Log "Rename ticket already raised for '$DesiredHostname' - skipping"
@@ -2173,12 +2430,17 @@ function Run-AssetSync {
                 } else {
                     Log "Rename ticketing disabled in silent mode - skipping"
                 }
-                $ok = Invoke-HostnameRenameSafe -DesiredHostname $DesiredHostname -Force
-                if ($ok) {
-                    Clear-QueuedRename
-                    if ($Reboot) {
-                        Log "Reboot requested after rename - restarting in 60 seconds"
-                        shutdown.exe /r /t 60 /c "ITFlow Agent: Rename to '$DesiredHostname' completed. Rebooting to apply."
+                if ($renameRetryCount -ge 3) {
+                    Log "Rename skipped for '$DesiredHostname' ($renameRetryCount previous failures)"
+                } else {
+                    $ok = Invoke-HostnameRenameSafe -DesiredHostname $DesiredHostname -Force
+                    if ($ok) {
+                        Clear-QueuedRename
+                        Set-AgentCacheValue -Name "RenameRetry_$DesiredHostname" -Value 0
+                        if ($Reboot) {
+                            Log "Reboot requested after rename - restarting in 60 seconds"
+                            shutdown.exe /r /t 60 /c "ITFlow Agent: Rename to '$DesiredHostname' completed. Rebooting to apply."
+                        }
                     }
                 }
             }
@@ -2195,6 +2457,7 @@ function Run-AssetSync {
                 # Set asset_name once if blank (do not rename computer based on blank)
                 Log "Asset name empty in ITFlow - setting it to local hostname once"
                 $script:SetAssetNameOnce = $true
+                Set-AgentCacheValue -Name "SetAssetNameOnce" -Value 1
             }
 
             # =============================
@@ -2205,6 +2468,9 @@ function Run-AssetSync {
                 client_id = [int]$EffectiveClientId
                 asset_id  = [int]$asset.asset_id
             }
+
+            $lastCheckIn = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $update.asset_description = "Last Check-In: $lastCheckIn"
 
             # Local normalized values
             $localStatus = Normalize-Value $DefaultAssetStatus
@@ -2228,7 +2494,7 @@ function Run-AssetSync {
             if ($localModel -and ($itModel -ne $localModel)) { $update.asset_model = $inv.Model }
 
             # Set asset_name once if blank
-            if ($script:SetAssetNameOnce) { $update.asset_name = $inv.Hostname }
+            if ($script:SetAssetNameOnce -or (Get-AgentCacheValue -Name "SetAssetNameOnce" -Default 0) -eq 1) { $update.asset_name = $inv.Hostname }
 
             # ===== MAC/IP WRITE-ONLY =====
             # - Do NOT read/compare from ITFlow (API does not return these fields on your instance).
@@ -2296,7 +2562,7 @@ function Run-AssetSync {
                 -ConfiguredClientId $EffectiveClientId -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId
             if ($AllowFollowClientTransfer -and $discoveredClientId -gt 0) {
                 $origClientId = $EffectiveClientId
-                if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -Serial $inv.Serial | Out-Null }
+if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)" -ClientId $origClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
                 $EffectiveClientId = $discoveredClientId
                 $script:LastRunState.TransferFollowed = $true
                 if ($AutoUpdateClientIdOnTransfer -and $EffectiveClientId -ne [int]$Config.ClientId) {
@@ -2305,28 +2571,53 @@ function Run-AssetSync {
                     if ($persistOk) { $script:LastRunState.ClientIdAutoUpdated = $true }
                 }
                 Log "Following transfer: EffectiveClientId updated to $EffectiveClientId (asset_id=$discoveredAssetId)"
-                if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($inv.Hostname) | Serial: $($inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId | Out-Null }
+                if ($EnableTicketingSilent) { Create-ITFlowTicket -Title "[TRANSFER FOLLOWED] $($inv.Hostname) | Serial: $($inv.Serial) now in client_id=$EffectiveClientId (asset_id=$discoveredAssetId)" -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Original Client ID: $origClientId`nNew Client ID: $EffectiveClientId`nAsset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null }
                 $asset = $moved
                 $script:CurrentAssetId = [int]$asset.asset_id
                 Log "Transfer lookup succeeded, asset_id=$script:CurrentAssetId"
-                # Re-enter the main block so rename+update happen this sync
+                # Re-enter the loop with the transferred asset so rename+update can happen
                 $lookup = [pscustomobject]@{ success = "True"; data = @($asset) }
                 $retrySyncAfterTransfer = $true
             } else {
                 Log "WARNING: Serial '$($inv.Serial)' exists in ITFlow under client_id=$discoveredClientId (asset_id=$discoveredAssetId). Aborting."
                 if ($CreateTransferMismatchTicket) {
                     $ticketTitle = "[TRANSFER DETECTED] $($inv.Hostname) | Serial: $($inv.Serial) moved to client_id=$discoveredClientId (asset_id=$discoveredAssetId)"
-                    Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $inv.Serial | Out-Null
+                    Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId $discoveredAssetId -Details "Configured Client ID: $EffectiveClientId`nDiscovered Client ID: $discoveredClientId`nDiscovered Asset ID: $discoveredAssetId`nSerial: $($inv.Serial)`nHostname: $($inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec" | Out-Null
                 }
                 $script:LastSyncOK = $false
                 return
             }
         } else {
-            Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId
+            $sb = New-Object System.Text.StringBuilder
+            $null = $sb.AppendLine("Device Information")
+            $null = $sb.AppendLine("==================")
+            $null = $sb.AppendLine("Hostname:   $($snapshot.Device.Hostname)")
+            $null = $sb.AppendLine("Serial:     $($snapshot.Device.Serial)")
+            $null = $sb.AppendLine("Make/Model: $($snapshot.Device.Make) / $($snapshot.Device.Model)")
+            $null = $sb.AppendLine("OS:         $($snapshot.Device.OS)")
+            $null = $sb.AppendLine("Type:       $($snapshot.Device.AssetType)")
+            $null = $sb.AppendLine("MAC:        $($snapshot.Device.PrimaryMAC)")
+            $null = $sb.AppendLine("IP:         $($snapshot.Device.PrimaryIP)")
+            $null = $sb.AppendLine("")
+            $null = $sb.AppendLine("Device specification")
+            $null = $sb.AppendLine("--------------------")
+            $null = $sb.Append($DeviceSpec)
+            $enrollDetails = $sb.ToString()
+            Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $enrollDetails -DeviceSpec $DeviceSpec
         }
     }
     } while ($retrySyncAfterTransfer)
     $retrySyncAfterTransfer = $false
+
+    # Sync AD computer attributes (works when running as SYSTEM via scheduled task)
+    try {
+        Sync-ADComputerAttributes -Snapshot $snapshot -DeviceSpec $DeviceSpec -LastCheckIn $lastCheckIn
+    } catch {
+        Log "Sync-ADComputerAttributes threw (non-fatal): $($_.Exception.Message)"
+    }
+
+    # Device Report trigger (GPO registry key)
+    Invoke-DeviceReportCheck -Hostname $inv.Hostname -Serial $inv.Serial -ClientId $EffectiveClientId -DeviceSpec $DeviceSpec
 
     # Persist success flag for silent-mode retry logic
     $script:LastSyncOK = $true
@@ -2392,7 +2683,7 @@ function Set-ITFlowTaskTrigger {
         $task | Set-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
         Log "Scheduled task '$TaskName' set to startup trigger"
     } elseif ($Hourly) {
-        # Don't re-apply if already hourly — preserves the 24h duration countdown
+        # Don't re-apply if already hourly - preserves the 24h duration countdown
         $hasRepetition = $task.Triggers -and $task.Triggers[0].Repetition -and $task.Triggers[0].Repetition.Interval
         if ($hasRepetition) {
             Log "Scheduled task '$TaskName' already on hourly retry - keeping existing trigger"
@@ -2427,6 +2718,17 @@ if ($Install) {
     }
 
     if ($existingTask -and $installedVersion -and $installedVersion -ne $AgentVersion) {
+        # Protect against downgrade: skip if installed version is newer
+        try {
+            $installedVer = [version]$installedVersion
+            $currentVer = [version]$AgentVersion
+            if ($installedVer -gt $currentVer) {
+                Log "Skipping downgrade: installed v$installedVersion is newer than this script v$AgentVersion"
+                exit 0
+            }
+        } catch {
+            Log "Version comparison failed (non-fatal): installed='$installedVersion' current='$AgentVersion' - proceeding with update"
+        }
         Log "Updating agent v$installedVersion -> v$AgentVersion..."
     } else {
         Log "Installing agent v$AgentVersion to $installPath..."
@@ -2448,7 +2750,7 @@ if ($Uninstall) {
     exit 0
 }
 
-# GUI ticket preference applies to all modes — read early for silent/worker contexts
+# GUI ticket preference applies to all modes - read early for silent/worker contexts
 $script:EnableTicketingGui = (Get-PreferenceDword -Name "CreateTicketsGui" -Default 1) -ne 0
 # Sync silent ticket flags with the GUI preference so the checkbox controls all tickets
 $EnableTicketingSilent = $script:EnableTicketingGui
