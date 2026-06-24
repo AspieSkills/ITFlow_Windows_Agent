@@ -1,6 +1,6 @@
 # ITFlow Agent — User Manual
 
-## Version 7.4.2 | PowerShell 5.1 | Windows
+## Version 7.4.3 | PowerShell 5.1 | Windows
 
 ---
 
