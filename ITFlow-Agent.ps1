@@ -1,6 +1,6 @@
-# =====================================================
+﻿# =====================================================
 # ITFlow PowerShell Agent
-# version - 7.4.2
+# version - 7.4.3
 # PowerShell 5.1 Compatible
 # =====================================================
 
@@ -38,7 +38,7 @@ $AllowUserInteraction = (-not $IsHeadlessExecution) -and (-not $script:IsWorkerR
 #===============================
 
 # Agent version
-$AgentVersion = "7.4.2"
+$AgentVersion = "7.4.3"
 
 # Current asset context for ticket linking (set during sync runs)
 $script:CurrentAssetId = $null
@@ -84,6 +84,7 @@ $script:LastRunState = [pscustomobject]@{
 
 # Prevent duplicate Local vs ITFlow compare blocks per run
 $script:LoggedLocalVsITFlow = $false
+$script:SetAssetNameOnce = $false
 
 # Sync result tracking for silent-mode retry logic
 $script:LastSyncOK = $true
@@ -162,24 +163,33 @@ function Invoke-AssetTransferFollow {
         [string]$DeviceSpec = ""
     )
 
-    $origClientId = [int]$Config.ClientId
+    $origClientId = if ($Config.ClientId) { [int]$Config.ClientId } else { 0 }
     Write-AssetTransferLog -Serial $Inv.Serial -Hostname $Inv.Hostname `
         -ConfiguredClientId $origClientId -DiscoveredClientId $DiscoveredClientId -DiscoveredAssetId $DiscoveredAssetId
+
+    # Set CurrentAssetId before any ticket creation so Create-ITFlowTicket can
+    # use $script:CurrentAssetId as a fallback for asset linking.
+    $script:CurrentAssetId = $DiscoveredAssetId
 
     if (-not $AllowFollowClientTransfer -or $DiscoveredClientId -le 0) {
         Log "WARNING: Serial '$($Inv.Serial)' exists in ITFlow under client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId). Aborting."
         if ($CreateTransferMismatchTicket) {
             $title = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
             $details = "Configured Client ID: $origClientId`nDiscovered Client ID: $DiscoveredClientId`nDiscovered Asset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
-            Create-ITFlowTicket -Title $title -ClientId $origClientId -AssetId $DiscoveredAssetId -Details $details | Out-Null
+            # Do NOT pass -AssetId here: the asset belongs to $DiscoveredClientId, not $origClientId.
+            # Cross-client asset linking would be rejected by the API.
+            Create-ITFlowTicket -Title $title -ClientId $origClientId -Details $details | Out-Null
         }
+        $script:CurrentAssetId = $null
         return [pscustomobject]@{ Followed = $false }
     }
 
     if ($EnableTicketingSilent) {
         $title = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
         $details = "Original Client ID: $origClientId`nDiscovered Client ID: $DiscoveredClientId`nDiscovered Asset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
-        Create-ITFlowTicket -Title $title -ClientId $origClientId -AssetId $DiscoveredAssetId -Details $details | Out-Null
+        # Do NOT pass -AssetId here: the asset belongs to $DiscoveredClientId, not $origClientId.
+        # Cross-client asset linking would be rejected by the API.
+        Create-ITFlowTicket -Title $title -ClientId $origClientId -Details $details | Out-Null
     }
 
     $script:LastRunState.TransferFollowed = $true
@@ -196,7 +206,6 @@ function Invoke-AssetTransferFollow {
         Create-ITFlowTicket -Title $title -ClientId $DiscoveredClientId -AssetId $DiscoveredAssetId -Details $details | Out-Null
     }
 
-    $script:CurrentAssetId = $DiscoveredAssetId
     Log "Following transfer: EffectiveClientId updated to $DiscoveredClientId (asset_id=$DiscoveredAssetId)"
 
     return [pscustomobject]@{ Followed = $true; DiscoveredClientId = $DiscoveredClientId; DiscoveredAssetId = $DiscoveredAssetId }
@@ -383,6 +392,22 @@ function Test-ADComputerNameExists {
         $result = $searcher.FindOne()
 
         if ($result -and $result.Properties["distinguishedname"]) {
+            # PDC emulator verification (replication-lag guard for multi-DC environments)
+            try {
+                $domainObj = [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()
+                $pdc = $domainObj.PdcRoleOwner
+                $pdcRoot = "LDAP://$($pdc.Name)/$($domainObj.Name)"
+                $pdcSearcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$pdcRoot)
+                $pdcSearcher.Filter = "(&(objectCategory=computer)(sAMAccountName=$DesiredHostname`$))"
+                $pdcSearcher.PropertiesToLoad.AddRange(@("distinguishedName")) | Out-Null
+                $pdcResult = $pdcSearcher.FindOne()
+                if (-not $pdcResult) {
+                    Log "AD conflict detected on local DC but not on PDC emulator ($($pdc.Name)) — replication lag, treating as non-conflict"
+                    return [pscustomobject]@{ IsDomainJoined = $true; Exists = $false; ExistingDN = $null; ExistingSerial = "" }
+                }
+            } catch {
+                Log "PDC verification unavailable (ignored): $($_.Exception.Message)"
+            }
             $dn = $result.Properties["distinguishedname"][0]
             $existingSerial = if ($result.Properties.serialnumber) { $result.Properties.serialnumber[0] } else { "" }
             return [pscustomobject]@{ IsDomainJoined = $true; Exists = $true; ExistingDN = $dn; ExistingSerial = $existingSerial }
@@ -506,8 +531,12 @@ function Invoke-DeviceReportCheck {
     if ($triggered) {
         $title = "[DEVICE REPORT] $Hostname | Serial: $Serial"
         Create-ITFlowTicket -Title $title -ClientId $ClientId -Serial $Serial -Details $DeviceSpec | Out-Null
-        Set-TicketFlag $regName | Out-Null
-        Log "Device report ticket created for '$Serial'"
+        $flagOk = Set-TicketFlag $regName
+        if ($flagOk) {
+            Log "Device report ticket created for '$Serial'"
+        } else {
+            Log "WARN: Device report ticket created but flag write failed - may re-trigger on next sync"
+        }
     }
 }
 
@@ -531,9 +560,11 @@ if (-not $Worker) {
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Security
+if ($AllowUserInteraction) {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+}
 
 # =====================================================
 # Test for Elevation
@@ -592,10 +623,7 @@ function Set-ConfiguredClientId {
         if (Test-Path $IniPath) {
             $content = [System.IO.File]::ReadAllText($IniPath)
             $content = $content -replace "(?m)(?<=^\[ITFlow\]\r?\n.*?)^ClientId=.*", "ClientId=$NewClientId"
-            try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch {
-                Start-Sleep -Milliseconds 200
-                try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
-            }
+            Write-IniFileSafely -Path $IniPath -Content $content
             Log "Config ClientId saved to INI: $NewClientId"
         }
         return $true
@@ -688,7 +716,8 @@ function Read-RegValue {
         $section = $Path.Substring($RegRoot.Length + 1)
         try {
             $raw = [System.IO.File]::ReadAllText($IniPath)
-            if ($raw -match "(?ms)\[$section\].*?^$Name=([^\r\n]+)") { return $matches[1].Trim() }
+            $escapedName = [regex]::Escape($Name)
+            if ($raw -match "(?ms)\[$section\].*?^$escapedName=([^\r\n]+)") { return $matches[1].Trim() }
         } catch { }
     }
     return $null
@@ -701,16 +730,14 @@ function Write-IniValue {
     $section = $Path.Substring($RegRoot.Length + 1)
     $content = try { [System.IO.File]::ReadAllText($IniPath) } catch { "" }
     if (-not $content) { $content = "" }
+    $escapedName = [regex]::Escape($Name)
     if ($content -match "(?ms)\[$section\]") {
-        if ($content -match "(?m)^$Name$MatchPattern") { $content = $content -replace "(?m)^$Name$MatchPattern", "$Name=$Value" }
+        if ($content -match "(?m)^$escapedName$MatchPattern") { $content = $content -replace "(?m)^$escapedName$MatchPattern", "$Name=$Value" }
         else { $content = $content -replace "(?m)(\[$section\])", "`$1`r`n$Name=$Value" }
     } else {
         $content = $content.TrimEnd() + "`r`n`r`n[$section]`r`n$Name=$Value"
     }
-    try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch {
-        Start-Sleep -Milliseconds 200
-        try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
-    }
+    Write-IniFileSafely -Path $IniPath -Content $content
 }
 
 function Write-RegDword {
@@ -772,30 +799,12 @@ function Get-PreferenceDword {
     # Fallback to INI file when registry unavailable
     if (Test-Path $IniPath) {
         try {
-            $line = Select-String -Path $IniPath -Pattern "^$Name=\d+$" | Select-Object -First 1 -ErrorAction SilentlyContinue
+            $escapedName = [regex]::Escape($Name)
+            $line = Select-String -Path $IniPath -Pattern "^$escapedName=\d+$" | Select-Object -First 1 -ErrorAction SilentlyContinue
             if ($line) { $val = ($line.Line -split '=')[1]; if ($val -match '^\d+$') { return [int]$val } }
         } catch { }
     }
     return $Default
-}
-
-function Set-PreferenceDword {
-    param([string]$Name, [int]$Value)
-    Write-RegDword -Path $RegPreferences -Name $Name -Value $Value
-    Log "Preference saved: $Name=$Value"
-}
-
-function Get-PreferenceString {
-    param([string]$Name, [string]$Default = "")
-    $v = Read-RegValue -Path $RegPreferences -Name $Name
-    if ($null -ne $v) { return (Normalize-Value $v) }
-    return $Default
-}
-
-function Set-PreferenceString {
-    param([string]$Name, [string]$Value)
-    Write-RegString -Path $RegPreferences -Name $Name -Value $Value
-    Log "Preference saved: $Name=$Value"
 }
 
 # --- Cache subkey (agent cache, replaces old AgentCache) ---
@@ -827,7 +836,8 @@ function Test-TicketFlag {
     if (Test-Path $IniPath) {
         try {
             $raw = [System.IO.File]::ReadAllText($IniPath)
-            return ($raw -match "(?ms)\[TicketFlags\].*?^$Name=1")
+            $escapedName = [regex]::Escape($Name)
+            return ($raw -match "(?ms)\[TicketFlags\].*?^$escapedName=1")
         } catch { }
     }
     return $false
@@ -850,13 +860,14 @@ function Set-TicketFlag {
     # Portable mode: write to INI
     $content = try { [System.IO.File]::ReadAllText($IniPath) } catch { "" }
     if (-not $content) { $content = "" }
+    $escapedName = [regex]::Escape($Name)
     if ($content -match "(?ms)\[TicketFlags\]") {
-        if ($content -match "(?m)^$Name=\d+$") { $content = $content -replace "(?m)^$Name=\d+$", "$Name=1" }
+        if ($content -match "(?m)^$escapedName=\d+$") { $content = $content -replace "(?m)^$escapedName=\d+$", "$Name=1" }
         else { $content = $content -replace "(?m)(\[TicketFlags\])", "`$1`r`n$Name=1" }
     } else {
         $content = $content.TrimEnd() + "`r`n`r`n[TicketFlags]`r`n$Name=1"
     }
-    try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
+    Write-IniFileSafely -Path $IniPath -Content $content
     Log "Ticket flag set: $Name"
     return $true
 }
@@ -881,10 +892,33 @@ function Clear-TicketFlag {
     if (Test-Path $IniPath) {
         $content = try { [System.IO.File]::ReadAllText($IniPath) } catch { "" }
         if ($content) {
-            $content = $content -replace "(?m)^$Name=.*`r?`n", ""
+            $escapedName = [regex]::Escape($Name)
+            $content = $content -replace "(?m)^$escapedName=.*`r?`n", ""
             $content = $content -replace "`r`n`r`n\[TicketFlags\]`r`n$", ""
-            try { Set-Content -Path $IniPath -Value $content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
+            Write-IniFileSafely -Path $IniPath -Content $content
         }
+    }
+}
+
+# =====================================================
+# INI FILE WRITE HELPER (thread-safe)
+# =====================================================
+$script:IniMutex = New-Object System.Threading.Mutex($false, "Global\ITFlow-INI-Write")
+
+function Write-IniFileSafely {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Content,
+        [int]$RetryDelayMs = 200
+    )
+    $script:IniMutex.WaitOne() | Out-Null
+    try {
+        Set-Content -Path $Path -Value $Content -Encoding UTF8 -Force -ErrorAction Stop
+    } catch {
+        Start-Sleep -Milliseconds $RetryDelayMs
+        try { Set-Content -Path $Path -Value $Content -Encoding UTF8 -Force -ErrorAction Stop } catch { }
+    } finally {
+        try { $script:IniMutex.ReleaseMutex() } catch {}
     }
 }
 
@@ -910,12 +944,7 @@ function Merge-IniSections {
     # Trim trailing whitespace, append new content
     $existing = $existing.TrimEnd() + "`r`n`r`n$NewContent`r`n"
 
-    try {
-        Set-Content -Path $FilePath -Value $existing -Encoding UTF8 -Force -ErrorAction Stop
-    } catch {
-        Start-Sleep -Milliseconds 200
-        Set-Content -Path $FilePath -Value $existing -Encoding UTF8 -Force -ErrorAction Stop
-    }
+    Write-IniFileSafely -Path $FilePath -Content $existing
 }
 
 # --- One-time migration from flat layout to structured subkeys ---
@@ -1077,9 +1106,9 @@ $RegCache         = "$RegRoot\Cache"
 $RegTicketFlags   = "$RegRoot\TicketFlags"
 $RegistryBasePath = $RegRoot
 
-$ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else {
+$ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Definition) {
     Split-Path -Parent $MyInvocation.MyCommand.Definition
-}
+} else { "" }
 $IniPath = Join-Path $ScriptRoot "ITFlow-AssetManager.ini"
 
 # =====================================================
@@ -1155,7 +1184,7 @@ $reg = $null
 
 if (Test-Path $RegistryBasePath) {
     try {
-        $reg = Get-ItemProperty $RegistryBasePath
+        $reg = Get-ItemProperty $RegistryBasePath -ErrorAction Stop
 
         if ($reg.BaseUrl)  { $Config.BaseUrl  = $reg.BaseUrl }
         if ($reg.ClientId) { $Config.ClientId = $reg.ClientId }
@@ -1242,25 +1271,46 @@ if ($reg -and $reg.ApiKey -and -not $Config.ApiKey) {
 # =====================================================
 # INVENTORY
 # =====================================================
+function Get-PrimaryInterfaceIndex {
+    $route = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Sort-Object RouteMetric | Select-Object -First 1
+    if ($route) { $route.InterfaceIndex } else { $null }
+}
+
 function Get-PrimaryMAC {
+    $ifIndex = Get-PrimaryInterfaceIndex
+    if ($ifIndex) {
+        $adapter = Get-NetAdapter -InterfaceIndex $ifIndex -ErrorAction SilentlyContinue
+        if ($adapter -and $adapter.MacAddress) { return Normalize-Mac $adapter.MacAddress }
+    }
+    # WMI fallback: find the IP-enabled adapter that has a default gateway
     $nic = Get-CimInstance Win32_NetworkAdapterConfiguration |
-        Where-Object { $_.IPEnabled -and $_.MACAddress } |
+        Where-Object { $_.IPEnabled -and $_.MACAddress -and $_.DefaultIPGateway } |
         Select-Object -First 1
-    if ($nic) { ($nic.MACAddress -replace '-',':').ToUpper() } else { $null }
+    if ($nic) { return Normalize-Mac $nic.MACAddress }
+    return $null
 }
 
 function Get-PrimaryIP {
-    $ips = Get-CimInstance Win32_NetworkAdapterConfiguration |
-        Where-Object { $_.IPEnabled -and $_.IPAddress } |
-        ForEach-Object {
-            $_.IPAddress | Where-Object {
-                $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and
-                $_ -notlike '169.*' -and
-                $_ -ne '127.0.0.1'
-            }
-        }
-
-if ($ips) { $ips | Select-Object -First 1 } else { $null }
+    $ifIndex = Get-PrimaryInterfaceIndex
+    if ($ifIndex) {
+        $ip = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike '169.*' -and $_.IPAddress -ne '127.0.0.1' } |
+            Select-Object -First 1 -ExpandProperty IPAddress
+        if ($ip) { return [string]$ip }
+    }
+    # WMI fallback: find the IP-enabled adapter that has a default gateway
+    $nic = Get-CimInstance Win32_NetworkAdapterConfiguration |
+        Where-Object { $_.IPEnabled -and $_.IPAddress -and $_.DefaultIPGateway } |
+        Select-Object -First 1
+    if ($nic) {
+        return ($nic.IPAddress | Where-Object {
+            $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and
+            $_ -notlike '169.*' -and
+            $_ -ne '127.0.0.1'
+        } | Select-Object -First 1)
+    }
+    return $null
 }
 
 function Get-LocalInventory {
@@ -1615,8 +1665,13 @@ function Get-FullSnapshot {
     )
 
     # Query CIM instances once and share across collectors
-    $cs = Get-CimInstance Win32_ComputerSystem
-    $os = Get-CimInstance Win32_OperatingSystem
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    } catch {
+        Log "CIM query failed in Get-FullSnapshot: $($_.Exception.Message)"
+        throw
+    }
 
     # Existing local inventory + derived type
     $inv = Get-LocalInventory -ComputerSystem $cs -OperatingSystem $os
@@ -1680,7 +1735,9 @@ function Write-LocalSysInfoFromSnapshot {
     $stamp       = Get-Date -Format "yyyy-MM-dd_HHmmss"
     $archiveFile = Join-Path $archiveDir "sysinfo_$hostname`_$stamp.json"
 
-    $json = $Snapshot | ConvertTo-Json -Depth 12
+    $snapshotForJson = [ordered]@{}
+    $Snapshot.Keys | Where-Object { $_ -notlike '_Cim*' } | ForEach-Object { $snapshotForJson[$_] = $Snapshot[$_] }
+    $json = $snapshotForJson | ConvertTo-Json -Depth 12
 
     # Atomic write
     Set-Content -Path $tmpFile -Value $json -Encoding UTF8 -Force
@@ -1708,13 +1765,13 @@ function Invoke-ITFlow {
 
     try {
         if ($Body) {
-            Invoke-RestMethod -Method $Method -Uri $Uri `
+            Invoke-RestMethod -UseBasicParsing -Method $Method -Uri $Uri `
                 -Body ($Body | ConvertTo-Json -Depth 6) `
                 -ContentType "application/json" `
                 -TimeoutSec 90 `
                 -ErrorAction Stop
         } else {
-            Invoke-RestMethod -Method $Method -Uri $Uri `
+            Invoke-RestMethod -UseBasicParsing -Method $Method -Uri $Uri `
                 -TimeoutSec 90 `
                 -ErrorAction Stop
         }
@@ -1896,8 +1953,13 @@ function Clear-QueuedRename {
 function Invoke-HostnameRenameSafe {
     param(
         [Parameter(Mandatory=$true)][string]$DesiredHostname,
-        [switch]$Force
+        [switch]$Force,
+        [string]$Serial = ""
     )
+
+    if (-not $Serial) {
+        try { $Serial = $script:LastRunState.Serial } catch { $Serial = "" }
+    }
 
     Log "Rename requested: current='$env:COMPUTERNAME' target='$DesiredHostname' Force=$($Force.IsPresent)"
     try {
@@ -1932,9 +1994,10 @@ function Invoke-HostnameRenameSafe {
         if ($EnableRenameFailureTicketing) {
             $renameFailFlag = "RenameFailed_$DesiredHostname"
             if (-not (Test-TicketFlag $renameFailFlag)) {
-                $ticketTitle = "[RENAME FAILED] $($env:COMPUTERNAME) -> $DesiredHostname | Serial: $($inv.Serial) | Error: $($_.Exception.Message)"
+                $ticketTitle = "[RENAME FAILED] $($env:COMPUTERNAME) -> $DesiredHostname | Serial: $Serial | Error: $($_.Exception.Message)"
                 try { $assetIdForTicket = $script:CurrentAssetId } catch { $assetIdForTicket = $null }
-                Create-ITFlowTicket -Title $ticketTitle -ClientId $Config.ClientId -AssetId $assetIdForTicket -Details "Current Hostname: $($env:COMPUTERNAME)`nDesired Hostname: $DesiredHostname`nSerial: $($inv.Serial)`nError: $($_.Exception.Message)" | Out-Null
+                $ticketClientId = if ($Config.ClientId) { [int]$Config.ClientId } else { 0 }
+                Create-ITFlowTicket -Title $ticketTitle -ClientId $ticketClientId -AssetId $assetIdForTicket -Details "Current Hostname: $($env:COMPUTERNAME)`nDesired Hostname: $DesiredHostname`nSerial: $Serial`nError: $($_.Exception.Message)" | Out-Null
                 Set-TicketFlag $renameFailFlag | Out-Null
             }
         }
@@ -1955,8 +2018,17 @@ function Start-AssetEnrollment {
         [string]$Details = "",
 
         # Device specification block (appended to transfer tickets for forensic record)
-        [string]$DeviceSpec = ""
+        [string]$DeviceSpec = "",
+
+        # Recursion depth guard — prevents infinite re-entry when API persistently rejects creation
+        [int]$Depth = 0
     )
+
+    if ($Depth -ge 1) {
+        Log "Enrollment recursion limit reached — giving up (serial='$($Inv.Serial)')"
+        $script:LastSyncOK = $false
+        return
+    }
 
     Log "Enrollment (create): no existing asset found for serial '$($Inv.Serial)' - creating new asset in client_id=$EffectiveClientId"
     Log ("Enrollment (create): payload name='{0}' type='{1}' make='{2}' model='{3}' os='{4}' ip='{5}' mac='{6}' status='{7}'" -f $Inv.Hostname,$DetectedAssetType,$Inv.Make,$Inv.Model,$Inv.OS,$Inv.IP,$Inv.MAC,$DefaultAssetStatus)
@@ -1981,8 +2053,8 @@ function Start-AssetEnrollment {
             $globalLookup = Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&asset_serial=$($Inv.Serial)" $null "Transfer lookup by serial"
             if ("$($globalLookup.success)" -eq "True" -and ($globalLookup.data -and $globalLookup.data.Count -gt 0)) {
                 $moved = $globalLookup.data | Select-Object -First 1
-                $discoveredClientId = [int](Normalize-Value $moved.asset_client_id)
-                $discoveredAssetId  = [int](Normalize-Value $moved.asset_id)
+                $discoveredClientId = try { [int](Normalize-Value $moved.asset_client_id) } catch { 0 }
+                $discoveredAssetId  = try { [int](Normalize-Value $moved.asset_id) } catch { 0 }
                 $followResult = Invoke-AssetTransferFollow -Inv $Inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
                 if ($followResult.Followed) {
                     $EffectiveClientId = $followResult.DiscoveredClientId
@@ -1992,29 +2064,8 @@ function Start-AssetEnrollment {
                     return
                 }
             } else {
-                Log "Asset not found in configured client, checking for transferred copy..."
-                $foundTransferred = $false
-                try {
-                    $transferLookup = Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&asset_serial=$($inv.Serial)" $null "Transfer lookup by serial"
-                    $foundTransferred = "$($transferLookup.success)" -eq "True" -and ($transferLookup.data -and $transferLookup.data.Count -gt 0)
-                } catch {
-                    Log "Transfer lookup: serial not found in any client"
-                }
-                if ($foundTransferred) {
-                    $moved = $transferLookup.data | Select-Object -First 1
-                    $discoveredClientId = [int](Normalize-Value $moved.asset_client_id)
-                    $discoveredAssetId  = [int](Normalize-Value $moved.asset_id)
-                    $followResult = Invoke-AssetTransferFollow -Inv $inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
-                    if ($followResult.Followed) {
-                        $EffectiveClientId = $followResult.DiscoveredClientId
-                        $lookup = [pscustomobject]@{ success = "True"; data = @($moved) }
-                    } else {
-                        $script:LastSyncOK = $false
-                        return
-                    }
-                } else {
-                    Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $Details -DeviceSpec $DeviceSpec
-                }
+                Log "Serial '$($Inv.Serial)' not found in any client. Proceeding with enrollment."
+                Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $Details -DeviceSpec $DeviceSpec -Depth ($Depth + 1)
             }
         } catch {
             Log "Transfer lookup failed: serial not found in any client"
@@ -2058,7 +2109,8 @@ function Run-AssetSync {
 
 
         # Reset per-run guard (prevents duplicate compare logging)
-        $script:LoggedLocalVsITFlow = $false
+$script:LoggedLocalVsITFlow = $false
+$script:SetAssetNameOnce = $false
         # Reset per run to prevent GUI session bleed
         # --- Cancellation checkpoint (Added) ---
         Throw-IfCancelRequested
@@ -2165,7 +2217,7 @@ function Run-AssetSync {
     Log "Detected Asset Type: $DetectedAssetType"
 
     # Effective client_id for this run (may change if asset was transferred)
-    $EffectiveClientId = [int]$Config.ClientId
+    $EffectiveClientId = if ($Config.ClientId) { [int]$Config.ClientId } else { 0 }
 
 
     # Reset per-run UI state (ALWAYS do this once per run)
@@ -2239,6 +2291,7 @@ function Run-AssetSync {
 
         # Loop allows one re-entry after transfer follow so rename+update happen in the same sync
         $retrySyncAfterTransfer = $false
+        $lastCheckIn = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
         do {
         if ("$($lookup.success)" -eq "True" -and ($lookup.data -and $lookup.data.Count -gt 0)) {
             $asset = $lookup.data[0]
@@ -2348,6 +2401,7 @@ function Run-AssetSync {
                                     Log "Rename conflict ticket already raised for '$DesiredHostname' - skipping"
                                 }
 
+                                $script:LastSyncOK = $false
                                 return
                             }
                         }
@@ -2399,6 +2453,7 @@ function Run-AssetSync {
                                     Log "Rename conflict ticket already raised for '$DesiredHostname' - skipping"
                                 }
 
+                                $script:LastSyncOK = $false
                                 return
                             }
                         }
@@ -2487,7 +2542,6 @@ function Run-AssetSync {
                 # Set asset_name once if blank (do not rename computer based on blank)
                 Log "Asset name empty in ITFlow - setting it to local hostname once"
                 $script:SetAssetNameOnce = $true
-                Set-AgentCacheValue -Name "SetAssetNameOnce" -Value 1
             }
 
             # =============================
@@ -2499,7 +2553,6 @@ function Run-AssetSync {
                 asset_id  = [int]$asset.asset_id
             }
 
-            $lastCheckIn = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
             $update.asset_description = "Last Check-In: $lastCheckIn"
 
             # Local normalized values
@@ -2523,8 +2576,9 @@ function Run-AssetSync {
             if ($localMake  -and ($itMake  -ne $localMake))  { $update.asset_make  = $inv.Make }
             if ($localModel -and ($itModel -ne $localModel)) { $update.asset_model = $inv.Model }
 
-            # Set asset_name once if blank
-            if ($script:SetAssetNameOnce -or (Get-AgentCacheValue -Name "SetAssetNameOnce" -Default 0) -eq 1) { $update.asset_name = $inv.Hostname }
+            # Set asset_name once if blank (in-memory flag, not persisted — the
+            # blank/non-blank state of ITFlow's asset_name itself drives retry)
+            if ($script:SetAssetNameOnce) { $update.asset_name = $inv.Hostname; $script:SetAssetNameOnce = $false }
 
             # ===== MAC/IP WRITE-ONLY =====
             # - Do NOT read/compare from ITFlow (API does not return these fields on your instance).
@@ -2546,8 +2600,15 @@ function Run-AssetSync {
             }
 
             if ($update.Count -gt 3) {
-                $resp = Invoke-ITFlow POST "$($Config.BaseUrl)/api/v1/assets/update.php" $update
+                try {
+                    $resp = Invoke-ITFlow POST "$($Config.BaseUrl)/api/v1/assets/update.php" $update
+                } catch {
+                    Log "Asset update API call failed: $($_.Exception.Message)"
+                    $resp = $null
+                }
+                if ($resp) {
                 Log ("Asset update API response: " + ($resp | ConvertTo-Json -Depth 4 -Compress))
+                }
 
                 if ($resp -and "$($resp.success)" -eq "True") {
                     $changed = $update.Keys | Where-Object { $_ -notin @('api_key','asset_id','client_id') }
@@ -2578,8 +2639,8 @@ function Run-AssetSync {
         }
         if ($foundTransferred) {
             $moved = $transferLookup.data | Select-Object -First 1
-            $discoveredClientId = [int](Normalize-Value $moved.asset_client_id)
-            $discoveredAssetId  = [int](Normalize-Value $moved.asset_id)
+            $discoveredClientId = try { [int](Normalize-Value $moved.asset_client_id) } catch { 0 }
+            $discoveredAssetId  = try { [int](Normalize-Value $moved.asset_id) } catch { 0 }
             $followResult = Invoke-AssetTransferFollow -Inv $inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
             if ($followResult.Followed) {
                 $EffectiveClientId = $followResult.DiscoveredClientId
@@ -2606,6 +2667,7 @@ function Run-AssetSync {
             $null = $sb.AppendLine("--------------------")
             $null = $sb.Append($DeviceSpec)
             $enrollDetails = $sb.ToString()
+            $retrySyncAfterTransfer = $false
             Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $enrollDetails -DeviceSpec $DeviceSpec
         }
     }
@@ -2699,6 +2761,18 @@ function Set-ITFlowTaskTrigger {
     }
 }
 
+# =====================================================
+# Mutex-safe exit helper
+# =====================================================
+function Exit-WithMutexRelease {
+    param([int]$ExitCode = 0)
+    if (-not $Worker -and $script:mutex) {
+        try { $script:mutex.ReleaseMutex() } catch {}
+        try { $script:mutex.Dispose() } catch {}
+    }
+    exit $ExitCode
+}
+
 # Handle -Install / -Uninstall before anything else (even before silent mode)
 if ($Install) {
     $installDir = "C:\ProgramData\ITFlow"
@@ -2716,8 +2790,8 @@ if ($Install) {
 
     if ($existingTask -and $installedVersion -eq $AgentVersion) {
         Log "Agent v$AgentVersion already installed - triggering scheduled task"
-            try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null } catch { try { schtasks.exe /run /tn $TaskName *>$null 2>&1 } catch { Log "Task trigger failed: $($_.Exception.Message)" } }
-        exit 0
+            try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null } catch { try { schtasks.exe /run /tn $TaskName *>$null } catch { Log "Task trigger failed: $($_.Exception.Message)" } }
+        Exit-WithMutexRelease
     }
 
     if ($existingTask -and $installedVersion -and $installedVersion -ne $AgentVersion) {
@@ -2727,7 +2801,7 @@ if ($Install) {
             $currentVer = [version]$AgentVersion
             if ($installedVer -gt $currentVer) {
                 Log "Skipping downgrade: installed v$installedVersion is newer than this script v$AgentVersion"
-                exit 0
+                Exit-WithMutexRelease
             }
         } catch {
             Log "Version comparison failed (non-fatal): installed='$installedVersion' current='$AgentVersion' - proceeding with update"
@@ -2741,16 +2815,16 @@ if ($Install) {
     try { if (-not (Test-Path $installDir)) { New-Item -Path $installDir -ItemType Directory -Force | Out-Null }; Copy-Item -Path $PSCommandPath -Destination $installPath -Force -ErrorAction Stop; Log "Script copied to $installPath" } catch { Log "ERROR: Failed to copy script: $($_.Exception.Message)" }
     if (-not $TaskScriptPath) { $TaskScriptPath = $installPath }
     Install-ITFlowScheduledTask
-    try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null } catch { schtasks.exe /run /tn $TaskName *>$null 2>&1 }
+    try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null } catch { try { schtasks.exe /run /tn $TaskName *>$null } catch { Log "Task trigger fallback failed: $($_.Exception.Message)" } }
     Log "Scheduled task triggered for first sync"
-    exit 0
+    Exit-WithMutexRelease
 }
 if ($Uninstall) {
     Uninstall-ITFlowScheduledTask
     try { Remove-Item -LiteralPath "HKLM:\SOFTWARE\ITFlow" -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     try { Remove-Item -LiteralPath "C:\ProgramData\ITFlow" -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     Log "ITFlow agent fully uninstalled"
-    exit 0
+    Exit-WithMutexRelease
 }
 
 # GUI ticket preference applies to all modes - read early for silent/worker contexts
@@ -2789,7 +2863,7 @@ if ($Silent) {
         Set-ITFlowTaskTrigger -Hourly
     }
 
-    if ($Worker) { return } else { exit 0 }
+    if ($Worker) { return } else { Exit-WithMutexRelease }
 }
 
 # =====================================================
@@ -2880,10 +2954,11 @@ $btnInstall.Height = 32
 $headerLeftFlow.Controls.Add($btnInstall)
 
 $script:IsInstalled = $false
+$script:InstallPollIsUninstall = $null
+$script:RenamePollTimer = $null
 
 function Update-InstallButton {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    $script:IsInstalled = [bool]$task
+    $script:IsInstalled = Test-Path "C:\ProgramData\ITFlow\ITFlow-Agent.ps1" -ErrorAction SilentlyContinue
     $btnInstall.Text = if ($script:IsInstalled) { "Uninstall" } else { "Install" }
 }
 
@@ -3180,17 +3255,7 @@ function Update-RenameButtonState {
 function Invoke-GuiRenameFromButton {
     if (-not $AllowUserInteraction) { return }
 
-    # Self-elevate if needed
-    if (-not (Test-IsAdmin)) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "Renaming the computer requires administrator privileges.`r`n`r`nClose this window and re-launch as Administrator, or run:`r`npowershell.exe -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Silent -Rename",
-            "Elevation Required",
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
-        return
-    }
-
+    # Resolve target first (needed by both elevation and direct paths)
     $target = $null
     try { $target = [string]$script:btnRename.Tag } catch { $target = $null }
 
@@ -3204,7 +3269,73 @@ function Invoke-GuiRenameFromButton {
         return
     }
 
-    $ok = Invoke-HostnameRenameSafe -DesiredHostname $target
+    # Self-elevate if needed
+    if (-not (Test-IsAdmin)) {
+        $resp = [System.Windows.Forms.MessageBox]::Show(
+            "Renaming the computer requires administrator privileges. Restart as administrator?",
+            "Elevation Required",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
+            try {
+                Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Silent -Rename -Worker" -ErrorAction Stop | Out-Null
+                # Poll for rename completion by monitoring the queued-rename state
+                $script:RenamePollTarget = $target
+                $script:RenamePollCount = 0
+                $script:RenamePollTimer = New-Object System.Windows.Forms.Timer
+                $script:RenamePollTimer.Interval = 1000
+                $script:RenamePollTimer.Add_Tick({
+                    $script:RenamePollCount++
+                    $remaining = Get-QueuedRenameTarget
+                    if (-not $remaining) {
+                        $script:RenamePollTimer.Stop()
+                        $script:RenamePollTimer.Dispose()
+                        $script:RenamePollCount = 0
+                        $tgt = $script:RenamePollTarget
+                        $script:RenamePollTarget = $null
+                        Update-RenameButtonState
+                        Update-InstallButton
+                        Set-Status "Rename completed. Reboot pending." ([System.Drawing.Color]::ForestGreen)
+                        try {
+                            $rebootNow = [System.Windows.Forms.MessageBox]::Show(
+                                "Rename completed successfully to '$tgt'.`r`n`r`nA reboot is required for the change to fully apply. Reboot now?",
+                                "Rename Completed",
+                                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                                [System.Windows.Forms.MessageBoxIcon]::Question
+                            )
+                            if ($rebootNow -eq [System.Windows.Forms.DialogResult]::Yes) {
+                                Log "User chose to reboot immediately after rename"
+                                shutdown.exe /r /t 30 /c "ITFlow Agent: Rename to '$tgt' completed. Rebooting to apply."
+                            } else {
+                                Log "User deferred reboot after rename"
+                            }
+                        } catch { }
+                    } elseif ($script:RenamePollCount -ge 30) {
+                        $script:RenamePollTimer.Stop()
+                        $script:RenamePollTimer.Dispose()
+                        $script:RenamePollCount = 0
+                        $script:RenamePollTarget = $null
+                        Update-RenameButtonState
+                        Set-Status "Rename check complete" ([System.Drawing.Color]::Gray)
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "Rename operation may have failed or completed silently. Check the logs for details.",
+                            "Rename Check",
+                            [System.Windows.Forms.MessageBoxButtons]::OK,
+                            [System.Windows.Forms.MessageBoxIcon]::Information
+                        ) | Out-Null
+                    }
+                })
+                $script:RenamePollTimer.Start()
+            } catch {
+                Log "Rename elevation failed: $($_.Exception.Message)"
+            }
+        }
+        return
+    }
+
+    try { $serialForRename = $script:LastRunState.Serial } catch { $serialForRename = "" }
+    $ok = Invoke-HostnameRenameSafe -DesiredHostname $target -Serial $serialForRename
 
     if ($ok) {
         Clear-QueuedRename
@@ -3338,6 +3469,7 @@ function Start-SyncAsync {
     # - Silent prevents GUI creation in the worker
     # - LogPath forces the worker to write into the same log file so UI can tail it
     $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
     $script:SyncPS.AddScript({
         param($path, $logPath)
         & $path -Silent -Worker -LogPath $logPath
@@ -3760,8 +3892,8 @@ $btnSave.Add_Click({
         $script:AllowFollowClientTransfer     = [bool]$cbFollow.Checked
         $script:AutoUpdateClientIdOnTransfer  = [bool]$cbAuto.Checked
         # Re-sync silent ticket flags immediately (so in-memory state matches saved config)
-        $EnableTicketingSilent = $script:EnableTicketingGui
-        $EnableRenameFailureTicketing = $script:EnableTicketingGui
+        $script:EnableTicketingSilent = $script:EnableTicketingGui
+        $script:EnableRenameFailureTicketing = $script:EnableTicketingGui
 
         $enc = Protect-String $Config.ApiKey
         # Write preferences to INI for portable mode fallback (merge, never destroy)
@@ -3802,14 +3934,70 @@ $btnInstall.Add_Click({
 
     # Self-elevate if needed
     if (-not (Test-IsAdmin)) {
+        $wantsUninstall = $script:IsInstalled
+        $verb = if ($wantsUninstall) { "Uninstall" } else { "Install" }
+        $flag = if ($wantsUninstall) { "-Uninstall" } else { "-Install" }
+
         $resp = [System.Windows.Forms.MessageBox]::Show(
-            "Install requires administrator privileges. Restart as administrator?",
+            "$verb requires administrator privileges. Restart as administrator?",
             "Elevation Required",
             [System.Windows.Forms.MessageBoxButtons]::YesNo,
             [System.Windows.Forms.MessageBoxIcon]::Question
         )
         if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
-            try { Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" -Install -TaskScriptPath `"$installPath`" -Worker" -ErrorAction Stop } catch {
+            try {
+                Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList "-ExecutionPolicy Bypass -File `"$PSCommandPath`" $flag -TaskScriptPath `"$installPath`" -Worker" -ErrorAction Stop | Out-Null
+                # Store intent in script scope for timer callback (avoids closure issues)
+                $script:InstallPollIsUninstall = $wantsUninstall
+                $script:InstallPollPath = $installPath
+                $script:InstallPollCount = 0
+                $script:InstallPollTimer = New-Object System.Windows.Forms.Timer
+                $script:InstallPollTimer.Interval = 1000
+                $script:InstallPollTimer.Add_Tick({
+                    $script:InstallPollCount++
+                    Update-InstallButton
+                    if ($script:InstallPollIsUninstall -and -not $script:IsInstalled) {
+                        $script:InstallPollTimer.Stop()
+                        $script:InstallPollTimer.Dispose()
+                        $script:InstallPollCount = 0
+                        $script:InstallPollPath = $null
+                        $script:InstallPollIsUninstall = $null
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "Scheduled task, registry keys, and C:\ProgramData\ITFlow have been removed.",
+                            "Uninstall Complete",
+                            [System.Windows.Forms.MessageBoxButtons]::OK,
+                            [System.Windows.Forms.MessageBoxIcon]::Information
+                        ) | Out-Null
+                    } elseif (-not $script:InstallPollIsUninstall -and $script:IsInstalled) {
+                        $script:InstallPollTimer.Stop()
+                        $script:InstallPollTimer.Dispose()
+                        $script:InstallPollCount = 0
+                        $path = $script:InstallPollPath
+                        $script:InstallPollPath = $null
+                        $script:InstallPollIsUninstall = $null
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "Agent installed to $path`r`nScheduled task created (runs at startup as SYSTEM).`r`n`r`nThe script at the original location is no longer needed by the task.",
+                            "Install Complete",
+                            [System.Windows.Forms.MessageBoxButtons]::OK,
+                            [System.Windows.Forms.MessageBoxIcon]::Information
+                        ) | Out-Null
+                    } elseif ($script:InstallPollCount -ge 120) {
+                        $script:InstallPollTimer.Stop()
+                        $script:InstallPollTimer.Dispose()
+                        $script:InstallPollCount = 0
+                        $script:InstallPollPath = $null
+                        $verb = if ($script:InstallPollIsUninstall) { "Uninstall" } else { "Install" }
+                        $script:InstallPollIsUninstall = $null
+                        [System.Windows.Forms.MessageBox]::Show(
+                            "$verb timed out after 2 minutes. Check the logs for details.",
+                            "$verb Failed",
+                            [System.Windows.Forms.MessageBoxButtons]::OK,
+                            [System.Windows.Forms.MessageBoxIcon]::Error
+                        ) | Out-Null
+                    }
+                })
+                $script:InstallPollTimer.Start()
+            } catch {
                 Log "Elevation failed: $($_.Exception.Message)"
             }
         }
@@ -3951,9 +4139,7 @@ $form.Add_Shown({
 # =====================================================
 $script:SyncRunning = $false
 $script:CancelSyncRequested = $false
-if (Get-Command Set-UiRunningState -ErrorAction SilentlyContinue) {
-    Set-UiRunningState -Running:$false
-}
+Set-UiRunningState -Running:$false
 
 # Check for pending computer rename from a previous session
 $startupPendingRename = Test-PendingComputerRename
@@ -3986,6 +4172,12 @@ try {
     }
 }
 finally {
+    # Stop timers to prevent lingering handles after form close
+    try { $script:TailTimer.Stop(); $script:TailTimer.Dispose() } catch {}
+    try { $script:PollTimer.Stop(); $script:PollTimer.Dispose() } catch {}
+    try { $script:OverviewTimer.Stop(); $script:OverviewTimer.Dispose() } catch {}
+    try { $script:InstallPollTimer.Stop(); $script:InstallPollTimer.Dispose() } catch {}
+    try { $script:RenamePollTimer.Stop(); $script:RenamePollTimer.Dispose() } catch {}
     # Release mutex only in non-worker mode
     if (-not $Worker -and $script:mutex) {
         try { $script:mutex.ReleaseMutex() } catch {}
