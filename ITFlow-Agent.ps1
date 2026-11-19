@@ -1,6 +1,6 @@
 ﻿# =====================================================
 # ITFlow PowerShell Agent
-# version - 7.4.3
+# version - 8.2.2
 # PowerShell 5.1 Compatible
 # =====================================================
 
@@ -33,12 +33,17 @@ $IsHeadlessExecution = $Silent
 $script:IsWorkerRunspace = $Worker
 $AllowUserInteraction = (-not $IsHeadlessExecution) -and (-not $script:IsWorkerRunspace)
 
+# True only when this process runs as the LocalSystem account (the startup scheduled task).
+# Security hardening (v7.5.5) gates its fail-closed self-checks on this so GUI/portable runs,
+# which never do privileged startup work, are never blocked.
+$script:IsSystemContext = try { [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem } catch { $false }
+
 #===============================
 #  Global Variables
 #===============================
 
 # Agent version
-$AgentVersion = "7.4.3"
+$AgentVersion = "8.2.2"
 
 # Current asset context for ticket linking (set during sync runs)
 $script:CurrentAssetId = $null
@@ -60,6 +65,21 @@ $EnableRenameFailureTicketing        = $true
 # Auto-update configured ClientId when transfer-follow occurs (all-client scoped API key environments)
 $AutoUpdateClientIdOnTransfer = $true
 
+# Dynamic Contact Assignment from User Logon Activity
+$AssignContactFromLogons = $false
+$AssignContactLookbackDays = 90
+$AssignContactHalfLifeDays = 14
+$AssignContactAllowedDomain = ""
+
+# Priority sent on every ticket the agent raises. ITFlow 26.09 changed the default
+# applied when none is given - its changelog says Medium, the API reference still
+# says Low - so the agent states the value rather than inheriting either. "Low" keeps
+# the behaviour agent tickets had before 26.09. Valid: Low, Medium, High.
+$TicketPriority = "Low"
+
+# Verbose debug logging (gated by checkbox; useful for diagnosing event log / contact issues)
+$VerboseLogging = $false
+
 # Scheduled task name for -Install / -Uninstall
 $TaskName = "ITFlow-Agent-Sync"
 
@@ -79,7 +99,25 @@ $script:LastRunState = [pscustomobject]@{
     SysInfoCollectedAt = ""
     RenameRequired     = $false
     TargetHostname     = ""
+    AuthFailed         = $false
+    AuthFailureReason  = ""
+    PermissionDenied   = $false
+    PermissionReason   = ""
+    AssetArchived      = $false
+    KeyScope           = ""
 }
+
+# ITFlow 26.08: API keys are owned by a user and inherit that user's role, module
+# and client permissions. These hold what the current key was observed to be able
+# to do, so the run can log when transfer detection is operating blind.
+$script:ApiKeyScope = $null
+$script:AuthFailureReason = $null
+$script:PermissionFailureReason = $null
+# asset_specs computed from the snapshot once per Run-AssetSync
+$script:LocalAssetSpecs = [ordered]@{}
+$script:AssetSpecsUnsupportedLogged = $false
+# Chassis/PCSystemType behind the last Get-AssetType answer (debug logging)
+$script:LastChassisInfo = ""
 
 
 # Prevent duplicate Local vs ITFlow compare blocks per run
@@ -175,7 +213,17 @@ function Invoke-AssetTransferFollow {
         Log "WARNING: Serial '$($Inv.Serial)' exists in ITFlow under client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId). Aborting."
         if ($CreateTransferMismatchTicket) {
             $title = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
-            $details = "Configured Client ID: $origClientId`nDiscovered Client ID: $DiscoveredClientId`nDiscovered Asset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`nBlocked: AllowFollowClientTransfer=$false`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
+            $infoPairs = [ordered]@{
+                "Configured Client ID" = $origClientId
+                "Discovered Client ID" = $DiscoveredClientId
+                "Discovered Asset ID"  = $DiscoveredAssetId
+                "Serial"               = $Inv.Serial
+                "Hostname"             = $Inv.Hostname
+                "Blocked"              = "AllowFollowClientTransfer=$false"
+            }
+            $details = New-ITFlowTicketBody -DeviceSpec $DeviceSpec -Sections @(
+                (New-ITFlowTicketSection -Title "Transfer Detected" -Icon "🔀" -InnerHtml (New-ITFlowTicketKeyValueTable $infoPairs))
+            )
             # Do NOT pass -AssetId here: the asset belongs to $DiscoveredClientId, not $origClientId.
             # Cross-client asset linking would be rejected by the API.
             Create-ITFlowTicket -Title $title -ClientId $origClientId -Details $details | Out-Null
@@ -186,7 +234,16 @@ function Invoke-AssetTransferFollow {
 
     if ($EnableTicketingSilent) {
         $title = "[TRANSFER DETECTED] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
-        $details = "Original Client ID: $origClientId`nDiscovered Client ID: $DiscoveredClientId`nDiscovered Asset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
+        $infoPairs = [ordered]@{
+            "Original Client ID"   = $origClientId
+            "Discovered Client ID" = $DiscoveredClientId
+            "Discovered Asset ID"  = $DiscoveredAssetId
+            "Serial"               = $Inv.Serial
+            "Hostname"             = $Inv.Hostname
+        }
+        $details = New-ITFlowTicketBody -DeviceSpec $DeviceSpec -Sections @(
+            (New-ITFlowTicketSection -Title "Transfer Detected" -Icon "🔀" -InnerHtml (New-ITFlowTicketKeyValueTable $infoPairs))
+        )
         # Do NOT pass -AssetId here: the asset belongs to $DiscoveredClientId, not $origClientId.
         # Cross-client asset linking would be rejected by the API.
         Create-ITFlowTicket -Title $title -ClientId $origClientId -Details $details | Out-Null
@@ -202,7 +259,17 @@ function Invoke-AssetTransferFollow {
 
     if ($EnableTicketingSilent) {
         $title = "[TRANSFER FOLLOWED] $($Inv.Hostname) | Serial: $($Inv.Serial) now in client_id=$DiscoveredClientId (asset_id=$DiscoveredAssetId)"
-        $details = "Original Client ID: $origClientId`nNew Client ID: $DiscoveredClientId`nAsset ID: $DiscoveredAssetId`nSerial: $($Inv.Serial)`nHostname: $($Inv.Hostname)`nAuto-Update: $($AutoUpdateClientIdOnTransfer)`n`n---`nDevice specification`n----------------------`n$DeviceSpec"
+        $infoPairs = [ordered]@{
+            "Original Client ID" = $origClientId
+            "New Client ID"      = $DiscoveredClientId
+            "Asset ID"           = $DiscoveredAssetId
+            "Serial"             = $Inv.Serial
+            "Hostname"           = $Inv.Hostname
+            "Auto-Update"        = $AutoUpdateClientIdOnTransfer
+        }
+        $details = New-ITFlowTicketBody -DeviceSpec $DeviceSpec -Sections @(
+            (New-ITFlowTicketSection -Title "Transfer Followed" -Icon "🔀" -InnerHtml (New-ITFlowTicketKeyValueTable $infoPairs))
+        )
         Create-ITFlowTicket -Title $title -ClientId $DiscoveredClientId -AssetId $DiscoveredAssetId -Details $details | Out-Null
     }
 
@@ -342,17 +409,18 @@ function Test-ITFlowDuplicateAssetName {
 
     try {
         # Query by exact asset name (client-scoped first to reduce noise)
-        $uri = "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&client_id=$EffectiveClientId&asset_name=$DesiredHostname"
+        $uri = New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ client_id = $EffectiveClientId; asset_name = $DesiredHostname })
         $resp = Invoke-ITFlowChecked GET $uri $null "Asset name duplicate check"
 
         if ($resp -and "$($resp.success)" -eq "True" -and $resp.count -gt 0) {
-            $others = @($resp.data | Where-Object { [int]$_.asset_id -ne $CurrentAssetId })
+            # Archived records don't hold a live name, so they don't block a rename.
+            $others = @($resp.data | Where-Object { [int]$_.asset_id -ne $CurrentAssetId -and -not (Test-ITFlowAssetArchived $_) })
             if ($others.Count -gt 0) {
                 return [pscustomobject]@{
                     IsDuplicate = $true
                     Count       = $resp.count
                     OtherAssetIds = ($others | ForEach-Object { [int]$_.asset_id })
-                    OtherAssetSerials = ($others | ForEach-Object { [string]$_.serial })
+                    OtherAssetSerials = ($others | ForEach-Object { [string]$_.asset_serial })
                 }
             }
         }
@@ -488,10 +556,11 @@ function Sync-ADComputerAttributes {
             }
         }
 
-        # 3) info (Notes) - full device specification block
+        # 3) info (Notes) - full device specification block. $DeviceSpec is HTML
+        # (built for tickets); AD's Notes field needs plain text.
         if ($DeviceSpec) {
-            $infoValue = $DeviceSpec
-            if ($LastCheckIn) { $infoValue += "`r`n`r`nLast Check-In: $LastCheckIn" }
+            $infoValue = ConvertFrom-ITFlowHtmlToPlainText $DeviceSpec
+            if ($LastCheckIn) { $infoValue += "`r`n`r`nLast Check-In: $LastCheckIn (Agent v$AgentVersion)" }
             $currentInfo = if ($result.Properties.info) { $result.Properties.info[0] } else { "" }
             if ($currentInfo -ne $infoValue) {
                 try {
@@ -530,7 +599,8 @@ function Invoke-DeviceReportCheck {
 
     if ($triggered) {
         $title = "[DEVICE REPORT] $Hostname | Serial: $Serial"
-        Create-ITFlowTicket -Title $title -ClientId $ClientId -Serial $Serial -Details $DeviceSpec | Out-Null
+        $details = New-ITFlowTicketBody -Sections @($DeviceSpec)
+        Create-ITFlowTicket -Title $title -ClientId $ClientId -Serial $Serial -Details $details | Out-Null
         $flagOk = Set-TicketFlag $regName
         if ($flagOk) {
             Log "Device report ticket created for '$Serial'"
@@ -573,6 +643,244 @@ function Test-IsAdmin {
     $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# =====================================================
+# SECURITY HARDENING HELPERS  (v7.5.5)
+# ---------------------------------------------------------------------------
+# The agent installs to C:\ProgramData\ITFlow and runs as SYSTEM at startup.
+# If an unprivileged user can overwrite the script, its install directory, or
+# the registry config it trusts, the next reboot yields SYSTEM code execution
+# (a local privilege-escalation chain: any user + reboot -> SYSTEM).
+#
+# These helpers close that chain. They are PS 5.1-native (Get-Acl/Set-Acl,
+# System.Security.AccessControl) and use well-known SIDs so they behave the
+# same on non-English Windows.
+# =====================================================
+
+# Well-known SIDs treated as privileged (write access by these is acceptable).
+$script:TrustedWriteSids = @(
+    'S-1-5-18',      # LocalSystem
+    'S-1-5-32-544',  # BUILTIN\Administrators
+    'S-1-5-19',      # LocalService
+    'S-1-5-20',      # NetworkService
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # NT SERVICE\TrustedInstaller
+)
+
+function Test-PathReparsePoint {
+    # True if the path exists and is a reparse point (junction / symlink).
+    param([string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)
+    } catch { return $false }
+}
+
+function Reset-SuspiciousInstallDir {
+    # Finding #2 (junction/hardlink planting): if the install directory is a
+    # reparse point, an attacker can redirect SYSTEM's writes into a protected
+    # location. Remove the reparse point *itself* (never follow it) so the caller
+    # can recreate a clean, admin-owned directory.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (Test-PathReparsePoint -Path $Path) {
+        Log "SECURITY: install directory '$Path' is a reparse point (possible junction-planting attack) - removing it"
+        try {
+            # Directory.Delete(path,$false) removes the junction, not its target contents.
+            [System.IO.Directory]::Delete($Path, $false)
+        } catch {
+            Log "SECURITY: failed to remove reparse point at '$Path': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Set-ITFlowHardenedAcl {
+    # Findings #1 & #2 remediation A: take ownership to Administrators, break
+    # inheritance, and set an explicit DACL of
+    #   SYSTEM:FullControl, Administrators:FullControl, Authenticated Users:ReadAndExecute
+    # Applied unconditionally on every install/update, even when the target
+    # pre-exists (resets a CREATOR OWNER foothold from a pre-created directory).
+    param(
+        [string]$Path,
+        [switch]$IsContainer
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $sidAuthU  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')
+        $isContainerPath = try { (Get-Item -LiteralPath $Path -Force).PSIsContainer } catch { [bool]$IsContainer }
+
+        # Phase 1: take ownership FIRST via a fresh security object that carries only
+        # the owner. Set-Acl then needs just WRITE_OWNER (granted to admins by
+        # SeTakeOwnershipPrivilege), so this succeeds even when an attacker pre-created
+        # the directory and stripped the inherited Administrators ACE (finding #2). Once
+        # we own it, we implicitly hold WRITE_DAC for phase 2.
+        try {
+            $ownerOnly = if ($isContainerPath) { New-Object System.Security.AccessControl.DirectorySecurity } else { New-Object System.Security.AccessControl.FileSecurity }
+            $ownerOnly.SetOwner($sidAdmins)
+            Set-Acl -LiteralPath $Path -AclObject $ownerOnly -ErrorAction Stop
+        } catch {
+            Log "SECURITY: could not take ownership of '$Path' before DACL reset: $($_.Exception.Message)"
+        }
+
+        # Phase 2: with ownership secured, break inheritance and set the explicit DACL.
+        $acl = Get-ACL -Path $Path
+        $acl.SetOwner($sidAdmins)
+        # Protect from inheritance and drop every existing/inherited ACE.
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRule($rule) }
+
+        if ($IsContainer) {
+            $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+        } else {
+            $inherit = [System.Security.AccessControl.InheritanceFlags]::None
+        }
+        $prop  = [System.Security.AccessControl.PropagationFlags]::None
+        $allow = [System.Security.AccessControl.AccessControlType]::Allow
+        $full  = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $rx    = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem, $full, $inherit, $prop, $allow)))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins, $full, $inherit, $prop, $allow)))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAuthU,  $rx,   $inherit, $prop, $allow)))
+
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        return $true
+    } catch {
+        Log "SECURITY: failed to harden ACL on '$Path': $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Protect-InstallPath {
+    # Remediation A + B for the install directory: neutralise a planted reparse
+    # point, ensure the directory exists, then lock down owner + DACL. Callers
+    # copy the script in afterwards and call Set-ITFlowHardenedAcl on the file.
+    param([Parameter(Mandatory=$true)][string]$InstallDir)
+    Reset-SuspiciousInstallDir -Path $InstallDir
+    if (-not (Test-Path -LiteralPath $InstallDir)) {
+        New-Item -Path $InstallDir -ItemType Directory -Force | Out-Null
+    }
+    Set-ITFlowHardenedAcl -Path $InstallDir -IsContainer | Out-Null
+}
+
+function Test-ScriptIntegrity {
+    # Remediation C (runtime fail-safe): verify the running script grants write
+    # only to trusted principals and is owned by one. Returns $false if any
+    # non-privileged principal can modify it, so the SYSTEM run can refuse
+    # privileged work. Fails closed on inspection errors.
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $true } # cannot inspect -> do not block
+    try {
+        if (Test-PathReparsePoint -Path $Path) {
+            Log "SECURITY: running script '$Path' is a reparse point - refusing privileged work"
+            return $false
+        }
+        # Atomic modify/write/ownership bits only. Do NOT fold in the composite
+        # rights Write/Modify/FullControl here: Modify and FullControl also carry
+        # read/execute/synchronize bits, so a benign read-only ACE (e.g.
+        # 'Authenticated Users: ReadAndExecute, Synchronize') would share bits
+        # with the mask and be misreported as writable, aborting the SYSTEM run.
+        # A FullControl/Modify/Write ACE is still caught because it contains
+        # these atomic write bits.
+        $writeMask = [System.Security.AccessControl.FileSystemRights]::WriteData `
+            -bor [System.Security.AccessControl.FileSystemRights]::AppendData `
+            -bor [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes `
+            -bor [System.Security.AccessControl.FileSystemRights]::WriteAttributes `
+            -bor [System.Security.AccessControl.FileSystemRights]::Delete `
+            -bor [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles `
+            -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions `
+            -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+
+        $acl = Get-ACL -Path $Path -ErrorAction Stop
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+            if (($ace.FileSystemRights -band $writeMask) -eq 0) { continue }
+            $sid = try { $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { "$($ace.IdentityReference)" }
+            if ($script:TrustedWriteSids -contains $sid) { continue }
+            Log "SECURITY: script is writable by non-privileged principal '$($ace.IdentityReference)' (SID $sid, rights $($ace.FileSystemRights)) - refusing privileged work"
+            return $false
+        }
+        $ownerSid = try { $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { $null }
+        if ($ownerSid -and -not ($script:TrustedWriteSids -contains $ownerSid)) {
+            Log "SECURITY: script owner '$ownerSid' is not a privileged principal - refusing privileged work"
+            return $false
+        }
+        return $true
+    } catch {
+        Log "SECURITY: script integrity check errored ($($_.Exception.Message)) - failing closed"
+        return $false
+    }
+}
+
+function Test-SafeSystemDir {
+    # Remediation E: before SYSTEM writes into a directory, confirm it is not a
+    # reparse point and (if it exists) is owned by a trusted principal. Returns
+    # $true when inspection is inconclusive so it never blocks legitimate writes.
+    param([string]$Path)
+    try {
+        if (Test-PathReparsePoint -Path $Path) { return $false }
+        if (Test-Path -LiteralPath $Path) {
+            $acl = Get-ACL -Path $Path -ErrorAction Stop
+            $ownerSid = try { $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value } catch { $null }
+            if ($ownerSid -and -not ($script:TrustedWriteSids -contains $ownerSid)) { return $false }
+        }
+        return $true
+    } catch { return $true }
+}
+
+function Protect-RegistryKey {
+    # Remediation D: give HKLM\SOFTWARE\ITFlow an explicit DACL (Administrators
+    # + SYSTEM full, Users read-only) with inheritance disabled, instead of
+    # inheriting potentially loose parent permissions. Closes the config-tamper
+    # / API-key-exfiltration vector where the key is reported user-writable.
+    param([string]$RegPath)
+    try {
+        if (-not (Test-Path -LiteralPath $RegPath)) { return $false }
+        $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+        $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $sidUsers  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+
+        # Phase 1: take ownership first (mirrors Set-ITFlowHardenedAcl). If an
+        # attacker - or an older loose ACL - left the key owned by / readable only
+        # to a non-privileged principal, the phase-2 Get-Acl would fail and return
+        # $null, which previously surfaced as the misleading "You cannot call a
+        # method on a null-valued expression". Setting only the owner needs just
+        # WRITE_OWNER (SeTakeOwnershipPrivilege, held by admins/SYSTEM), after
+        # which we implicitly hold WRITE_DAC for the DACL rewrite below.
+        try {
+            $ownerOnly = New-Object System.Security.AccessControl.RegistrySecurity
+            $ownerOnly.SetOwner($sidAdmins)
+            Set-Acl -LiteralPath $RegPath -AclObject $ownerOnly -ErrorAction Stop
+        } catch {
+            Log "SECURITY: could not take ownership of registry key '$RegPath' before DACL reset: $($_.Exception.Message)"
+        }
+
+        # Phase 2: with ownership secured, break inheritance and set the DACL.
+        $acl = Get-ACL -Path $RegPath -ErrorAction Stop
+        if (-not $acl) { throw "Get-Acl returned no security descriptor for '$RegPath'" }
+        $acl.SetOwner($sidAdmins)
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRule($rule) }
+
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit'
+        $prop    = [System.Security.AccessControl.PropagationFlags]::None
+        $allow   = [System.Security.AccessControl.AccessControlType]::Allow
+        $full    = [System.Security.AccessControl.RegistryRights]::FullControl
+        $read    = [System.Security.AccessControl.RegistryRights]::ReadKey
+
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidSystem, $full, $inherit, $prop, $allow)))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidAdmins, $full, $inherit, $prop, $allow)))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($sidUsers,  $read, $inherit, $prop, $allow)))
+
+        Set-Acl -LiteralPath $RegPath -AclObject $acl -ErrorAction Stop
+        return $true
+    } catch {
+        Log "SECURITY: failed to harden registry key '$RegPath': $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # =====================================================
@@ -661,10 +969,27 @@ function Write-ConfigToRegistry {
 
     try {
         if (-not (Test-Path $RegRoot)) { New-Item -Path $RegRoot -Force | Out-Null }
+        if (-not (Test-Path $RegPreferences)) { New-Item -Path $RegPreferences -Force | Out-Null }
 
         Set-ItemProperty -LiteralPath $RegRoot -Name "BaseUrl"  -Value $Config.BaseUrl
         Set-ItemProperty -LiteralPath $RegRoot -Name "ClientId" -Value $Config.ClientId
         Set-ItemProperty -LiteralPath $RegRoot -Name "ApiKey"   -Value (Protect-String $Config.ApiKey)
+
+        # Remediation D: pin the BaseUrl written by an elevated admin. The SYSTEM
+        # run compares against this and refuses a tampered value (see Assert-BaseUrlPin).
+        Set-ItemProperty -LiteralPath $RegRoot -Name "InstalledBaseUrl" -Value $Config.BaseUrl
+
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "CreateTicketsGui" -Value $(if ($script:EnableTicketingGui) { 1 } else { 0 }) -Type DWord
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "FollowClientTransfers" -Value $(if ($AllowFollowClientTransfer) { 1 } else { 0 }) -Type DWord
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "AutoUpdateClientIdOnTransfer" -Value $(if ($AutoUpdateClientIdOnTransfer) { 1 } else { 0 }) -Type DWord
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactFromLogons" -Value $(if ($AssignContactFromLogons) { 1 } else { 0 }) -Type DWord
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactLookbackDays" -Value $AssignContactLookbackDays -Type DWord
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactHalfLifeDays" -Value $AssignContactHalfLifeDays -Type DWord
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactAllowedDomain" -Value $AssignContactAllowedDomain -Type String
+        Set-ItemProperty -LiteralPath $RegPreferences -Name "VerboseLogging" -Value $(if ($VerboseLogging) { 1 } else { 0 }) -Type DWord
+
+        # Remediation D: lock down the key's DACL after (re)writing config.
+        Protect-RegistryKey -RegPath $RegRoot | Out-Null
 
         return $true
     }
@@ -678,6 +1003,149 @@ function Write-ConfigToRegistry {
 #    Assetid to ticketAssetId helper
 #===================================
 
+function Test-ITFlowAssetArchived {
+    # assets/read.php has no archived filter (ITFlow 26.11 source: a plain
+    # SELECT * FROM assets WHERE asset_serial = ...), so archived rows come back
+    # alongside live ones. A row is archived when asset_archived_at holds a date.
+    param($Row)
+    if ($null -eq $Row) { return $false }
+    $v = Get-AssetProp $Row 'asset_archived_at'
+    if ([string]::IsNullOrWhiteSpace($v)) { return $false }
+    if ($v -match '^0000-00-00') { return $false }
+    return $true
+}
+
+function Select-ITFlowAssetRow {
+    # Split a read result into the first non-archived row and the archived ones.
+    # Rows are ordered by asset_id ascending, so taking data[0] picked the OLDEST
+    # match - an archived record over the live duplicate that replaced it.
+    # Windows PowerShell 5.1: @(<generic List>) inside a [pscustomobject]@{} literal
+    # throws "Argument types do not match", so collect into a plain array and
+    # build the object from pre-assigned locals.
+    param($Rows)
+    $active = $null
+    $archived = @()
+    foreach ($r in @($Rows)) {
+        if ($null -eq $r) { continue }
+        if (Test-ITFlowAssetArchived $r) { $archived += $r; continue }
+        if ($null -eq $active) { $active = $r }
+    }
+    [object[]]$archivedArr = $archived
+    $result = New-Object PSObject -Property @{ Active = $active; Archived = $archivedArr }
+    return $result
+}
+
+function Invoke-ArchivedAssetNotice {
+    # The only ITFlow record for this serial is archived. The API has no asset
+    # unarchive endpoint, and enrolling a new asset would duplicate the serial
+    # behind the archived one, so the agent stops and asks a technician to
+    # restore or delete the record. One ticket per condition (flag-guarded).
+    param(
+        [Parameter(Mandatory=$true)]$Inv,
+        [Parameter(Mandatory=$true)][int]$TicketClientId,
+        [Parameter(Mandatory=$true)]$ArchivedRow,
+        [Parameter(Mandatory=$true)][string]$FlagName,
+        [Parameter(Mandatory=$true)][string]$LogTag,
+        [Nullable[int]]$TicketAssetId = $null,
+        [string]$DeviceSpec = ""
+    )
+
+    $aid = Get-AssetProp $ArchivedRow 'asset_id'
+    $acid = Get-AssetProp $ArchivedRow 'asset_client_id'
+    $aat = Get-AssetProp $ArchivedRow 'asset_archived_at'
+    Log "$LogTag serial='$($Inv.Serial)' asset_id=$aid client_id=$acid archived_at='$aat' - not updating it and not enrolling a duplicate. Restore the asset in ITFlow (or delete it to let the agent enrol a new one)."
+
+    try { $script:LastRunState.AssetArchived = $true } catch { }
+
+    if ((($Silent -and $EnableTicketingSilent) -or (-not $Silent -and $EnableTicketingGui))) {
+        if (-not (Test-TicketFlag $FlagName)) {
+            $title = "[ARCHIVED] $($Inv.Hostname) | Serial: $($Inv.Serial) is checking in but its asset is archived"
+            $infoPairs = [ordered]@{
+                "Asset ID"     = $aid
+                "Client ID"    = $acid
+                "Archived at"  = $aat
+                "Hostname"     = $Inv.Hostname
+                "Serial"       = $Inv.Serial
+            }
+            $details = New-ITFlowTicketBody -DeviceSpec $DeviceSpec -Sections @(
+                (New-ITFlowTicketParagraph "This device is still running the ITFlow agent, but the only ITFlow asset with its serial number is archived."),
+                (New-ITFlowTicketSection -Title "Archived Asset" -Icon "🗄️" -InnerHtml (New-ITFlowTicketKeyValueTable $infoPairs)),
+                (New-ITFlowTicketParagraph "The agent will not update an archived asset or create a duplicate. Restore the asset to resume syncing, or delete it so the agent enrols a new one.")
+            )
+            Create-ITFlowTicket -Title $title -ClientId $TicketClientId -AssetId $TicketAssetId -Details $details | Out-Null
+            Set-TicketFlag $FlagName | Out-Null
+        } else {
+            Log "Archived-asset ticket already created ($FlagName) - skipping"
+        }
+    }
+}
+
+function Get-ITFlowTransferNote {
+    # ITFlow's Transfer to Client (agent/post/asset.php, bulk_transfer_client_asset)
+    # copies the asset into the new client under a NEW asset_id, archives the
+    # original, and appends to its notes:
+    #   Transferred asset <name> (old asset ID: X) from <A> to <B> (new asset ID: Y)
+    # The last such line is the most recent transfer. Returns $null when absent.
+    param($ArchivedRow)
+    $notes = Get-AssetProp $ArchivedRow 'asset_notes'
+    if (-not $notes) { return $null }
+    $found = [regex]::Matches($notes, 'Transferred asset .+? \(old asset ID: (\d+)\) from (.+?) to (.+?) \(new asset ID: (\d+)\)')
+    if ($found.Count -eq 0) { return $null }
+    $m = $found[$found.Count - 1]
+    $note = New-Object PSObject -Property @{
+        OldAssetId = [int]$m.Groups[1].Value
+        FromClient = $m.Groups[2].Value
+        ToClient   = $m.Groups[3].Value
+        NewAssetId = [int]$m.Groups[4].Value
+    }
+    return $note
+}
+
+function Invoke-ArchivedInClientDecision {
+    # The configured client holds only an archived record for this serial, and no
+    # live copy was found anywhere this key can read. Either ITFlow transferred it
+    # to a client outside the key's scope (its notes say so), or it was simply
+    # archived. Neither case may enrol a duplicate.
+    param(
+        [Parameter(Mandatory=$true)]$Inv,
+        [Parameter(Mandatory=$true)][int]$ClientId,
+        [Parameter(Mandatory=$true)]$ArchivedRow,
+        [string]$DeviceSpec = ""
+    )
+
+    $archivedId = $null
+    try { $archivedId = [int](Normalize-Value $ArchivedRow.asset_id) } catch { $archivedId = $null }
+
+    $note = Get-ITFlowTransferNote $ArchivedRow
+    if ($note) {
+        Log "TRANSFER_OUT_OF_SCOPE serial='$($Inv.Serial)' was transferred from '$($note.FromClient)' to '$($note.ToClient)' as asset_id=$($note.NewAssetId), but this key cannot see that client. Not enrolling a duplicate. Widen the key user's client access (the agent then follows it automatically) or reconfigure this device's ClientId."
+        try { $script:LastRunState.AssetArchived = $true } catch { }
+        if ((($Silent -and $EnableTicketingSilent) -or (-not $Silent -and $EnableTicketingGui))) {
+            if (-not (Test-TicketFlag "TransferOutOfScope")) {
+                $title = "[TRANSFER] $($Inv.Hostname) | Serial: $($Inv.Serial) moved to $($note.ToClient) (asset $($note.NewAssetId)) - agent key cannot follow"
+                $infoPairs = [ordered]@{
+                    "Archived asset here" = $archivedId
+                    "New asset ID"        = $note.NewAssetId
+                    "Hostname"            = $Inv.Hostname
+                    "Serial"              = $Inv.Serial
+                }
+                $details = New-ITFlowTicketBody -DeviceSpec $DeviceSpec -Sections @(
+                    (New-ITFlowTicketParagraph "ITFlow transferred this asset from $($note.FromClient) to $($note.ToClient)."),
+                    (New-ITFlowTicketSection -Title "Transfer" -Icon "🔀" -InnerHtml (New-ITFlowTicketKeyValueTable $infoPairs)),
+                    (New-ITFlowTicketParagraph "The device's agent is still configured for this client and its API key's user cannot read $($note.ToClient), so it cannot follow the transfer. Either grant that user access to $($note.ToClient) (the agent follows on its next run) or reconfigure the agent's Client ID on the device.")
+                )
+                Create-ITFlowTicket -Title $title -ClientId $ClientId -AssetId $archivedId -Details $details | Out-Null
+                Set-TicketFlag "TransferOutOfScope" | Out-Null
+            } else {
+                Log "Transfer-out-of-scope ticket already created - skipping"
+            }
+        }
+        return
+    }
+
+    Invoke-ArchivedAssetNotice -Inv $Inv -TicketClientId $ClientId -ArchivedRow $ArchivedRow -FlagName "AssetArchived" -LogTag "ASSET_ARCHIVED" -TicketAssetId $archivedId -DeviceSpec $DeviceSpec
+}
+
 function Resolve-AssetIdBySerial {
     param(
         [Parameter(Mandatory=$true)][string]$Serial,
@@ -685,11 +1153,15 @@ function Resolve-AssetIdBySerial {
     )
 
     try {
-        $uri = "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&client_id=$ClientId&asset_serial=$Serial"
+        $uri = New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ client_id = $ClientId; asset_serial = $Serial })
         $resp = Invoke-ITFlowChecked GET $uri $null "Resolve asset_id by serial"
 
-        if ($resp -and "$($resp.success)" -eq "True" -and $resp.count -gt 0 -and $resp.data -and $resp.data[0].asset_id) {
-            return [int]$resp.data[0].asset_id
+        if ($resp -and "$($resp.success)" -eq "True" -and $resp.count -gt 0 -and $resp.data) {
+            # Prefer the live asset; an archived one is still fine to link a ticket to.
+            $sel = Select-ITFlowAssetRow -Rows $resp.data
+            $row = $sel.Active
+            if ($null -eq $row -and $sel.Archived.Count -gt 0) { $row = $sel.Archived[0] }
+            if ($row -and $row.asset_id) { return [int]$row.asset_id }
         }
     } catch {
         Log "Resolve-AssetIdBySerial failed: $($_.Exception.Message)"
@@ -804,6 +1276,13 @@ function Get-PreferenceDword {
             if ($line) { $val = ($line.Line -split '=')[1]; if ($val -match '^\d+$') { return [int]$val } }
         } catch { }
     }
+    return $Default
+}
+
+function Get-PreferenceString {
+    param([string]$Name, [string]$Default = "")
+    $v = Read-RegValue -Path $RegPreferences -Name $Name
+    if ($null -ne $v) { return (Normalize-Value $v) }
     return $Default
 }
 
@@ -1088,6 +1567,15 @@ function Log-LocalVsITFlowVerbose {
     Log-CompareLine 'IP:'       $localIP       $itIP
     Log-CompareLine 'MAC:'      $localMAC      $itMAC
 
+    if ($script:LocalAssetSpecs -and $script:LocalAssetSpecs.Count -gt 0) {
+        $itSpecs = ConvertTo-ITFlowSpecMap $Asset
+        foreach ($k in $script:LocalAssetSpecs.Keys) {
+            $itVal = '(not returned)'
+            if ($null -ne $itSpecs) { $itVal = ''; if ($itSpecs.ContainsKey($k)) { $itVal = $itSpecs[$k] } }
+            Log-CompareLine ("spec.$k" + ':') (Normalize-Value $script:LocalAssetSpecs[$k]) $itVal
+        }
+    }
+
     # Cache context for IP/MAC send logic
     $lastMac = Get-AgentCacheValue -Name 'LastSentMAC' -Default ''
     $lastIp  = Get-AgentCacheValue -Name 'LastSentIP'  -Default ''
@@ -1141,7 +1629,16 @@ function Log {
 
     # Create log directory lazily, once per session
     if (-not $script:LogDirEnsured) {
-        $null = New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction SilentlyContinue
+        # Remediation E: under SYSTEM, don't create/follow a reparse point at the log
+        # root. Done inline (no Log call) to avoid recursion. If unsafe, leave the dir
+        # absent so the file append below simply no-ops instead of writing via a junction.
+        $logRootSafe = $true
+        if ($script:IsSystemContext) {
+            try { $logRootSafe = Test-SafeSystemDir -Path $LogRoot } catch { $logRootSafe = $true }
+        }
+        if ($logRootSafe) {
+            $null = New-Item -ItemType Directory -Path $LogRoot -Force -ErrorAction SilentlyContinue
+        }
         $script:LogDirEnsured = $true
     }
 
@@ -1227,6 +1724,12 @@ if (-not $script:RegistryAllowed -and (Test-IsAdmin)) {
         Log "Registry initialized for this session"
     } catch { Log "Registry init failed: $($_.Exception.Message)" }
 }
+# Remediation D: whenever we hold the key elevated, ensure its DACL is locked
+# down (Users read-only). Cheap and idempotent - covers keys created by older
+# agent versions that inherited loose parent permissions.
+if ($script:RegistryAllowed -and (Test-IsAdmin) -and (Test-Path $RegRoot)) {
+    Protect-RegistryKey -RegPath $RegRoot | Out-Null
+}
 if (-not $script:RegistryAllowed) {
     Log "Portable mode: registry not available, using INI-based config only"
 }
@@ -1267,6 +1770,448 @@ if ($reg -and $reg.ApiKey -and -not $Config.ApiKey) {
     }
 }
 
+# =====================================================
+# REMEDIATION D: BASEURL PIN ENFORCEMENT
+# The SYSTEM startup run must never send ?api_key=... to an attacker-supplied
+# host. Compare the loaded BaseUrl against the value pinned by the last elevated
+# admin install/config-save; if they differ under SYSTEM, refuse the tampered
+# value and fall back to the trusted pin (neutralises API-key exfiltration even
+# where the registry key is user-writable).
+# =====================================================
+if ($script:RegistryAllowed -and (Test-Path $RegRoot)) {
+    try {
+        $pinnedBaseUrl = (Get-ItemProperty -LiteralPath $RegRoot -Name "InstalledBaseUrl" -ErrorAction SilentlyContinue).InstalledBaseUrl
+    } catch { $pinnedBaseUrl = $null }
+    if ($pinnedBaseUrl -and $Config.BaseUrl -and ("$($Config.BaseUrl)".TrimEnd('/') -ne "$pinnedBaseUrl".TrimEnd('/'))) {
+        if ($script:IsSystemContext) {
+            Log "SECURITY: BaseUrl '$($Config.BaseUrl)' does not match the pinned install value '$pinnedBaseUrl' - config may be tampered. Using the pinned value."
+            $Config.BaseUrl = $pinnedBaseUrl
+        } else {
+            Log "BaseUrl differs from pinned install value (elevated/interactive run; not overriding). Current='$($Config.BaseUrl)' Pinned='$pinnedBaseUrl'"
+        }
+    }
+}
+
+
+# =====================================================
+# Dynamic Contact Assignment from User Logon Activity
+# =====================================================
+
+function Get-UserLogonDurations {
+    param(
+        [int]$LookbackDays = 90,
+        [string[]]$AllowedDomains = @(),
+        # Recency half-life (days). Session minutes are weighted 0.5^(ageDays/HalfLife)
+        # so a device that changes hands re-ranks toward the new owner within a few
+        # half-lives instead of staying anchored to the old owner's historical hours.
+        # Set to 0 to disable decay (flat cumulative sum, legacy behaviour).
+        [double]$HalfLifeDays = 14
+    )
+
+    $startTime   = (Get-Date).AddDays(-$LookbackDays)
+    $currentTime = Get-Date
+
+    $logonEvents  = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4624; StartTime=$startTime} -ErrorAction SilentlyContinue
+    $logoffEvents = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4634; StartTime=$startTime} -ErrorAction SilentlyContinue
+
+    if (-not $logonEvents) {
+        Log "No Security logon events found in the last $LookbackDays days"
+        return ,@()   # always an array, never $null (avoids null-deref in verbose callers)
+    }
+
+    # --- Boot-segment boundaries (fixes LogonId reuse across reboots) ---
+    # TargetLogonId (a LUID) is unique only since the last boot; over a long
+    # window the same value recurs, so pairing on LogonId alone conflates
+    # sessions from different boots. Segment the timeline by boot (4608 =
+    # "Windows is starting up") and key every session as "segment|LogonId".
+    $bootEvents = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4608; StartTime=$startTime} -ErrorAction SilentlyContinue
+    $bootTimes = @()
+    if ($bootEvents) { $bootTimes = @($bootEvents | ForEach-Object { $_.TimeCreated } | Sort-Object) }
+    $segmentOf = {
+        param($when)
+        $seg = 0
+        foreach ($bt in $bootTimes) { if ($when -ge $bt) { $seg++ } else { break } }
+        $seg
+    }
+
+    Log-Debug "Raw 4624=$(@($logonEvents).Count)  4634=$(@($logoffEvents).Count)  boots=$($bootTimes.Count)  halfLife=$HalfLifeDays"
+
+    $logons = @{}
+    $debugPassedType = 0
+    $debugPassedDomain = 0
+    foreach ($e in $logonEvents) {
+        $xml = [xml]$e.ToXml()
+        $data = @{}
+        $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+
+        $logonType = $data['LogonType']
+        if ($logonType -ne '2' -and $logonType -ne '10') { continue }
+        $debugPassedType++
+
+        $logonId = $data['TargetLogonId']
+        if (-not $logonId) { continue }
+
+        $domain = $data['TargetDomainName']
+        if ($AllowedDomains -and $AllowedDomains.Count -gt 0 -and $AllowedDomains -notcontains $domain) { continue }
+        $debugPassedDomain++
+
+        $userName = $data['TargetUserName']
+        if (-not $userName) { continue }
+
+        $seg = & $segmentOf $e.TimeCreated
+        $logons["$seg|$logonId"] = @{
+            UserName   = $userName
+            DomainName = $domain
+            LogonTime  = $e.TimeCreated
+            LogoffTime = $null
+            Closed     = $false
+        }
+    }
+    Log-Debug "FILTERS: PassedType=$debugPassedType PassedDomain=$debugPassedDomain LogonsBuilt=$($logons.Count)"
+
+    # Pair logoffs to logons within the same boot segment
+    foreach ($e in $logoffEvents) {
+        if (-not $e) { continue }
+        $xml = [xml]$e.ToXml()
+        $data = @{}
+        $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+        $logonId = $data['TargetLogonId']
+        if (-not $logonId) { continue }
+        $key = "$(& $segmentOf $e.TimeCreated)|$logonId"
+        if ($logons.ContainsKey($key)) {
+            $logons[$key]['LogoffTime'] = $e.TimeCreated
+            $logons[$key]['Closed']     = $true
+        }
+    }
+
+    # Group sessions by (lowercased) user
+    $userLogons = @{}
+    foreach ($k in $logons.Keys) {
+        $entry = $logons[$k]
+        $key = $entry['UserName'].ToLower()
+        if (-not $userLogons.ContainsKey($key)) {
+            $userLogons[$key] = @{ DomainName = $entry['DomainName']; Logons = @() }
+        }
+        $userLogons[$key]['Logons'] += $entry
+    }
+    Log-Debug "GROUP: $($userLogons.Keys.Count) unique users: $([string]::Join(', ', $userLogons.Keys))"
+
+    foreach ($user in $userLogons.Keys) {
+        $logonList = [System.Collections.ArrayList]$userLogons[$user]['Logons']
+        $logonList.Sort([System.Collections.Generic.Comparer[object]]::Create({ param($a,$b) $a['LogonTime'].CompareTo($b['LogonTime']) }))
+        $userLogons[$user]['Logons'] = $logonList
+    }
+
+    # Close orphaned (no-logoff) sessions at the earliest sensible boundary:
+    # the first boot after the logon (machine rebooted, logoff never fired),
+    # the same user's next logon, or now — whichever comes first.
+    foreach ($user in $userLogons.Keys) {
+        $logonList = $userLogons[$user]['Logons']
+        for ($i = 0; $i -lt $logonList.Count; $i++) {
+            if ($logonList[$i]['Closed']) { continue }
+            $candidates = New-Object System.Collections.ArrayList
+            if ($i + 1 -lt $logonList.Count) { $null = $candidates.Add($logonList[$i + 1]['LogonTime']) }
+            foreach ($bt in $bootTimes) { if ($bt -gt $logonList[$i]['LogonTime']) { $null = $candidates.Add($bt); break } }
+            $null = $candidates.Add($currentTime)
+            $logonList[$i]['LogoffTime'] = ($candidates | Sort-Object | Select-Object -First 1)
+            $logonList[$i]['Closed']     = $true
+        }
+    }
+
+    # Accumulate raw + recency-weighted minutes per user. Weighting is aged from
+    # each session's end time, so an idle-but-logged-on session (closed at "now")
+    # still counts fully toward its owner.
+    $durations = @{}
+    foreach ($user in $userLogons.Keys) {
+        $rawMinutes = 0.0
+        $weightedMinutes = 0.0
+        foreach ($entry in $userLogons[$user]['Logons']) {
+            if (-not $entry['LogoffTime'] -or -not $entry['LogonTime']) { continue }
+            $dur = ($entry['LogoffTime'] - $entry['LogonTime']).TotalMinutes
+            if ($dur -le 0 -or $dur -ge 525600) { continue }
+            $rawMinutes += $dur
+            if ($HalfLifeDays -gt 0) {
+                $ageDays = ($currentTime - $entry['LogoffTime']).TotalDays
+                if ($ageDays -lt 0) { $ageDays = 0 }
+                $weightedMinutes += $dur * [math]::Pow(0.5, $ageDays / $HalfLifeDays)
+            } else {
+                $weightedMinutes += $dur
+            }
+        }
+        $durations[$user] = [pscustomobject]@{
+            UserName        = $user
+            DomainName      = $userLogons[$user]['DomainName']
+            TotalMinutes    = [math]::Round($rawMinutes, 1)
+            WeightedMinutes = [math]::Round($weightedMinutes, 1)
+        }
+        Log-Debug "DURATION: $user ($($userLogons[$user]['DomainName'])) = raw $([math]::Round($rawMinutes,1))m / weighted $([math]::Round($weightedMinutes,1))m over $($userLogons[$user]['Logons'].Count) sessions"
+    }
+
+    # Rank by recency-weighted minutes (== raw when HalfLifeDays=0)
+    $result = New-Object System.Collections.ArrayList
+    foreach ($obj in $durations.Values) { $null = $result.Add($obj) }
+    $result.Sort([System.Collections.Generic.Comparer[object]]::Create({ param($a,$b) $b.WeightedMinutes.CompareTo($a.WeightedMinutes) }))
+    if ($result.Count -gt 0) {
+        Log-Debug "RETURN: top=$($result[0].UserName) weighted=$($result[0].WeightedMinutes)m raw=$($result[0].TotalMinutes)m domain=$($result[0].DomainName)"
+    }
+    Write-Output -NoEnumerate ($result.ToArray())
+}
+
+function Log-Debug {
+    param([string]$Message)
+    if ($Script:VerboseLogging) { Log "DEBUG: $Message" }
+}
+
+# Resolve a logged-on user's real email address from Active Directory.
+# The logon event only gives us sAMAccountName + NetBIOS/DNS domain, and
+# "$sam@$dnsdomain" (e.g. jsmith@company.local) almost never equals the user's
+# actual email. The userPrincipalName / mail attributes usually do, so those are
+# the authoritative fields for contact matching. Returns an ordered, de-duped
+# list of candidate email addresses (best first); empty if AD is unavailable.
+function Get-ADUserEmailCandidates {
+    param([string]$SamAccountName)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (-not $SamAccountName) { return $candidates }
+
+    # AD lookup only makes sense on domain-joined machines.
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        if (-not $cs.PartOfDomain) { Log-Debug "AD email lookup skipped for '$SamAccountName': not domain-joined"; return $candidates }
+    } catch { return $candidates }
+
+    try {
+        $domain = ([System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain()).Name
+        $root = "LDAP://$domain"
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$root)
+        # Strip any domain prefix/suffix; the event's TargetUserName is the bare sAMAccountName.
+        $sam = ($SamAccountName -split '\\')[-1]
+        $sam = ($sam -split '@')[0]
+        $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(sAMAccountName=$sam))"
+        $searcher.PropertiesToLoad.AddRange(@("userPrincipalName", "mail")) | Out-Null
+        $result = $searcher.FindOne()
+        if ($result) {
+            # UPN first (per operator guidance it is most often == the ITFlow contact email), then mail.
+            $upn  = if ($result.Properties["userprincipalname"]) { "$($result.Properties['userprincipalname'][0])".Trim() } else { "" }
+            $mail = if ($result.Properties["mail"]) { "$($result.Properties['mail'][0])".Trim() } else { "" }
+            if ($upn)  { $candidates.Add($upn) }
+            if ($mail) { $candidates.Add($mail) }
+            Log-Debug "AD email candidates for '$sam': UPN='$upn' mail='$mail'"
+        } else {
+            Log-Debug "AD user object not found for '$sam'"
+        }
+    } catch {
+        Log "AD email lookup failed for ${SamAccountName}: $($_.Exception.Message)"
+    }
+    return $candidates
+}
+
+function Test-ContactInClient {
+    # A contact read by email can belong to another client: before ITFlow 26.09 there
+    # was no way to narrow a read to one client, and a pre-26.09 server ignores the
+    # client_id filter we now send. Verify ownership from the returned row itself so
+    # the check holds on every server version.
+    #
+    # Returns $true when the row is confirmed in-client, or when it carries no client
+    # field at all - a leaner response must not silently disable contact assignment.
+    param($Contact, [int]$ClientId)
+
+    if (-not $Contact) { return $false }
+
+    foreach ($field in 'contact_client_id', 'client_id') {
+        $raw = $null
+        try { $raw = $Contact.$field } catch { $raw = $null }
+        if ($null -eq $raw -or "$raw" -eq "") { continue }
+        $cid = 0
+        if ([int]::TryParse(("$raw").Trim(), [ref]$cid)) { return ($cid -eq $ClientId) }
+    }
+
+    return $true
+}
+
+function Get-ITFlowContactsForClient {
+    # Reads return 50 records by default, adjustable with limit/offset. A single
+    # unpaged call therefore truncates the contact list on any client with more than
+    # 50 contacts, and the name-token fallback in Get-ITFlowContactByUser never sees
+    # the remainder. Since v7.5.5 raises a ticket when no contact matches, a truncated
+    # list does not just miss a match - it files a spurious "primary contact missing"
+    # ticket for a contact that exists.
+    param(
+        [int]$ClientId,
+        [int]$PageSize = 100,
+        [int]$MaxPages = 50
+    )
+
+    $all  = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $page = 0
+
+    while ($page -lt $MaxPages) {
+        $offset = $page * $PageSize
+        $uri = New-ITFlowReadUri -Endpoint 'contacts/read.php' -Query ([ordered]@{ client_id = $ClientId; limit = $PageSize; offset = $offset })
+        $resp = Invoke-ITFlowChecked GET $uri $null "Contacts page $($page + 1) for client $ClientId"
+
+        if (-not $resp -or "$($resp.success)" -ne "True" -or -not $resp.data) { break }
+        $rows = @($resp.data)
+        if ($rows.Count -eq 0) { break }
+
+        $newInPage = 0
+        foreach ($row in $rows) {
+            $cid = "$($row.contact_id)"
+            if ($cid -and $seen.ContainsKey($cid)) { continue }
+            if ($cid) { $seen[$cid] = $true }
+            $newInPage++
+            if (Test-ContactInClient -Contact $row -ClientId $ClientId) { $all.Add($row) | Out-Null }
+        }
+
+        # A page that contributed nothing new means the server ignored offset. Stop
+        # rather than re-reading the same page until the cap.
+        if ($newInPage -eq 0) {
+            Log-Debug "Contact paging: page $($page + 1) returned no new contacts (offset appears unsupported) - stopping"
+            break
+        }
+
+        # A short page is the last page.
+        if ($rows.Count -lt $PageSize) { $page++; break }
+        $page++
+    }
+
+    if ($page -ge $MaxPages) {
+        Log "Contact paging hit the $MaxPages-page cap for client $ClientId ($($all.Count) read) - the name-token fallback may be working from a partial list."
+    }
+    Log-Debug "Contact paging: read $($all.Count) contact(s) for client $ClientId across $page page(s)"
+    return $all
+}
+
+function Get-ITFlowContactByUser {
+    param(
+        [string]$UserName,
+        [string]$DomainName,
+        [int]$ClientId
+    )
+
+    # Build the ordered list of email candidates to try against ITFlow. AD-resolved
+    # UPN/mail come first (authoritative); the constructed "$UserName@$DomainName" is
+    # only a fallback for non-domain / Entra-joined machines where AD isn't reachable.
+    $candidateEmails = New-Object System.Collections.Generic.List[string]
+    foreach ($e in (Get-ADUserEmailCandidates -SamAccountName $UserName)) {
+        if ($e -and -not $candidateEmails.Contains($e)) { $candidateEmails.Add($e) }
+    }
+    # If the logon name already looks like a UPN/email (common on Entra-joined devices), use it.
+    if ($UserName -like '*@*' -and -not $candidateEmails.Contains($UserName)) { $candidateEmails.Add($UserName) }
+    $fallbackEmail = "$UserName@$DomainName"
+    if (-not $candidateEmails.Contains($fallbackEmail)) { $candidateEmails.Add($fallbackEmail) }
+
+    foreach ($candidateEmail in $candidateEmails) {
+        try {
+            # ITFlow 26.09: reads accept an optional client_id filter on top of the
+            # key's own scoping, and it can only narrow. Without it an all-clients key
+            # matching on email alone can return a contact belonging to a DIFFERENT
+            # client and assign it to this asset. Sent as a filter here and verified
+            # again below, because a pre-26.09 server ignores the parameter.
+            $uri = New-ITFlowReadUri -Endpoint 'contacts/read.php' -Query ([ordered]@{ client_id = $ClientId; contact_email = $candidateEmail })
+            $resp = Invoke-ITFlowChecked GET $uri $null "Contact lookup by email"
+            if ($resp -and "$($resp.success)" -eq "True" -and $resp.data -and $resp.data.Count -gt 0) {
+                $contact = $resp.data | Where-Object { Test-ContactInClient -Contact $_ -ClientId $ClientId } | Select-Object -First 1
+                if ($contact) {
+                    Log "Contact found by email match: $candidateEmail -> ID $($contact.contact_id)"
+                    return [int]$contact.contact_id
+                }
+                Log "Email lookup for $candidateEmail matched $($resp.data.Count) contact(s), none in client $ClientId - ignoring (cross-client match)"
+            }
+            Log-Debug "Email lookup did not return a contact for $candidateEmail"
+        } catch {
+            Log "Email contact lookup failed for ${candidateEmail}: $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        # Reads return 50 records by default, so an unpaged list silently truncates on
+        # any client with more than 50 contacts and the name-token fallback below never
+        # sees the rest. Page through the whole list instead.
+        $contactList = Get-ITFlowContactsForClient -ClientId $ClientId
+        if ($contactList -and $contactList.Count -gt 0) {
+            Log-Debug "Contact list returned $($contactList.Count) contacts, checking for name match..."
+            foreach ($contact in $contactList) {
+                $contactName = Normalize-Value $contact.contact_name
+                if (-not $contactName) { continue }
+
+                $tokens = $contactName -split '[\s\.\-_]+' | Where-Object { $_.Length -gt 0 }
+                $userTokens = $UserName -split '[\s\.\-_]+' | Where-Object { $_.Length -gt 0 }
+                if ($tokens.Count -eq 0 -or $userTokens.Count -eq 0) { continue }
+
+                $allMatch = $true
+                foreach ($token in $tokens) {
+                    $match = $false
+                    foreach ($uToken in $userTokens) {
+                        if ($token -eq $uToken) {
+                            $match = $true
+                            break
+                        }
+                    }
+                    if (-not $match) { $allMatch = $false; break }
+                }
+
+                if ($allMatch) {
+                    foreach ($uToken in $userTokens) {
+                        $match = $false
+                        foreach ($token in $tokens) {
+                            if ($token -eq $uToken) {
+                                $match = $true
+                                break
+                            }
+                        }
+                        if (-not $match) { $allMatch = $false; break }
+                    }
+                }
+
+                if ($allMatch) {
+                    Log "Contact found by name token match: $contactName -> ID $($contact.contact_id)"
+                    return [int]$contact.contact_id
+                }
+            }
+        }
+    } catch {
+        Log "Contact list lookup failed for client ${ClientId}: $($_.Exception.Message)"
+    }
+
+    Log "No ITFlow contact found for $DomainName\$UserName"
+    return $null
+}
+
+function Set-ITFlowAssetContact {
+    param(
+        [int]$AssetId,
+        [int]$ContactId,
+        [int]$ClientId
+    )
+
+    $body = @{
+        api_key          = $Config.ApiKey
+        asset_id         = $AssetId
+        client_id        = $ClientId
+        asset_contact_id = $ContactId
+    }
+
+    try {
+        $resp = Invoke-ITFlow POST "$($Config.BaseUrl)/api/v1/assets/update.php" $body
+        if ($resp -and "$($resp.success)" -eq "True") {
+            Log "Asset $AssetId contact assigned to contact ID $ContactId"
+            Set-AgentCacheValue -Name "LastAssignedContactId" -Value $ContactId
+            return $true
+        } else {
+            $msg = if ($resp -and $resp.message) { $resp.message } else { "Unknown error" }
+            $null = Register-ITFlowFailure -Text $msg -Action "Asset contact assign"
+            Log "Asset contact assignment failed for asset ${AssetId}: $msg"
+            return $false
+        }
+    } catch {
+        $err = $_.Exception.Message
+        $null = Register-ITFlowFailure -Text $err -Action "Asset contact assign"
+        Log "Asset contact assignment API call failed: $err"
+        return $false
+    }
+}
 
 # =====================================================
 # INVENTORY
@@ -1313,6 +2258,33 @@ function Get-PrimaryIP {
     return $null
 }
 
+function Get-OSFeatureVersion {
+    # Windows feature update (24H2, 21H2...). DisplayVersion exists from 20H2;
+    # ReleaseId (2009, 1909...) is the fallback on older builds. ITFlow's own asset
+    # examples carry it ("Windows 11 Pro 24H2"), and it is what tells a supported
+    # Windows 11 release from an expired one - the Caption alone cannot.
+    try {
+        $cv = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+        $dv = Normalize-Value $cv.DisplayVersion
+        if ($dv) { return $dv }
+        $rid = Normalize-Value $cv.ReleaseId
+        if ($rid) { return $rid }
+    } catch { }
+    return ""
+}
+
+function Get-OSDisplayName {
+    # Caption plus feature version, e.g. "Microsoft Windows 11 Pro 24H2". ITFlow's
+    # Asset Lifecycle end-of-support patterns (windows 10 not LTSC, server 2012 and
+    # older) still match with the suffix appended.
+    param([string]$Caption)
+    $c = Normalize-Value $Caption
+    if (-not $c) { return $c }
+    $fv = Get-OSFeatureVersion
+    if ($fv -and ($c -notmatch ('\b' + [regex]::Escape($fv) + '\b'))) { return "$c $fv" }
+    return $c
+}
+
 function Get-LocalInventory {
     param(
         $ComputerSystem = $null,
@@ -1323,7 +2295,7 @@ function Get-LocalInventory {
         Hostname = $env:COMPUTERNAME
         Make     = if ($ComputerSystem) { $ComputerSystem.Manufacturer } else { (Get-CimInstance Win32_ComputerSystem).Manufacturer }
         Model    = if ($ComputerSystem) { $ComputerSystem.Model } else { (Get-CimInstance Win32_ComputerSystem).Model }
-        OS       = if ($OperatingSystem) { $OperatingSystem.Caption } else { (Get-CimInstance Win32_OperatingSystem).Caption }
+        OS       = Get-OSDisplayName $(if ($OperatingSystem) { $OperatingSystem.Caption } else { (Get-CimInstance Win32_OperatingSystem).Caption })
         MAC      = Normalize-Mac (Get-PrimaryMAC)
         IP       = Get-PrimaryIP
     }
@@ -1380,14 +2352,39 @@ function Get-AssetType {
 
         $chassis = @()
         if ($enclosure -and $enclosure.ChassisTypes) { $chassis = @($enclosure.ChassisTypes) }
+        $pcSystemType = 0
+        try { $pcSystemType = [int]$ComputerSystem.PCSystemType } catch { $pcSystemType = 0 }
+        $script:LastChassisInfo = "chassis=$($chassis -join ','), PCSystemType=$pcSystemType"
 
-        $laptopChassis  = @(8,9,10,11,12,14,18,21)
-        $desktopChassis = @(3,4,5,6,7,15,16)
+        # SMBIOS chassis types. ITFlow 26.11 gates CPU/RAM/storage details by asset
+        # type and "Other" has none, so every PC form factor must land on Laptop or
+        # Desktop. ITFlow has no all-in-one type; Desktop carries the right details.
+        # ITFlow's Tablet type is for mobile devices (phone number, carrier, IMEI),
+        # so Windows tablets and 2-in-1s are Laptops.
+        #   Laptop : 8 Portable, 9 Laptop, 10 Notebook, 11 Hand Held, 12 Docking
+        #            Station, 14 Sub Notebook, 18 Expansion Chassis, 21 Peripheral
+        #            Chassis, 30 Tablet, 31 Convertible, 32 Detachable
+        #   Desktop: 3 Desktop, 4 Low Profile, 5 Pizza Box, 6 Mini Tower, 7 Tower,
+        #            13 All in One, 15 Space-saving, 16 Lunch Box, 24 Sealed-case
+        #            PC, 35 Mini PC, 36 Stick PC
+        #   Rack   : 17 Main Server Chassis, 23 Rack Mount, 28 Blade - with a client
+        #            OS (Server OS returned above) this is a rack workstation: Desktop
+        $laptopChassis  = @(8,9,10,11,12,14,18,21,30,31,32)
+        $desktopChassis = @(3,4,5,6,7,13,15,16,24,35,36)
+        $rackChassis    = @(17,23,28)
 
         if ($chassis | Where-Object { $laptopChassis -contains $_ })  { return "Laptop"  }
         if ($chassis | Where-Object { $desktopChassis -contains $_ }) { return "Desktop" }
+        if ($chassis | Where-Object { $rackChassis -contains $_ })    { return "Desktop" }
+
+        # Firmware reporting chassis 1/2 (Other/Unknown): Windows' own power-profile
+        # classification. 2 Mobile, 8 Slate -> Laptop; 1 Desktop, 3 Workstation,
+        # 6 Appliance PC -> Desktop. (4/5/7 are server roles, decided by OS above.)
+        if (@(2,8) -contains $pcSystemType)   { return "Laptop"  }
+        if (@(1,3,6) -contains $pcSystemType) { return "Desktop" }
 
         if ($model -match "Book|Notebook|Laptop|Ultrabook|ThinkPad|Latitude|EliteBook|ProBook") { return "Laptop" }
+        if ($model -match "AIO|All-in-One|AllInOne") { return "Desktop" }
         if ($model -match "Server|PowerEdge|ProLiant|ThinkSystem") { return "Server" }
 
         return $type
@@ -1508,31 +2505,60 @@ function Get-StorageInfo {
     }
 }
 
+function Get-DisplayVendorName {
+    # EDID ManufacturerName is a 3-letter PNP ID (e.g. "DEL"), not a real vendor
+    # name. Map the common ones for a usable asset_make; unknown codes pass through.
+    param([string]$PnpId)
+    if ([string]::IsNullOrWhiteSpace($PnpId)) { return $PnpId }
+    $map = @{
+        "DEL" = "Dell"; "SAM" = "Samsung"; "LGD" = "LG"; "GSM" = "LG";
+        "AUS" = "ASUS"; "ACI" = "Acer"; "ACR" = "Acer"; "HWP" = "HP";
+        "HPN" = "HP"; "BNQ" = "BenQ"; "VSC" = "ViewSonic"; "PHL" = "Philips";
+        "LEN" = "Lenovo"; "MSI" = "MSI"; "GBT" = "Gigabyte"; "SNY" = "Sony";
+        "SHP" = "Sharp"; "NEC" = "NEC"; "EIZ" = "EIZO"; "IVM" = "Iiyama"
+    }
+    $key = $PnpId.Trim().ToUpperInvariant()
+    if ($map.ContainsKey($key)) { return $map[$key] }
+    return $PnpId
+}
+
 function Get-DisplayInfo {
-    # EDID-based: model/name + physical size. Resolution is best-effort (typically primary/current).
+    # EDID-based: name, physical size, per-monitor preferred resolution and
+    # embedded/external classification. Best-effort - not every GPU driver
+    # populates WmiMonitorConnectionParams or WmiMonitorListedSupportedSourceModes.
     $displays = @()
 
     $monId = $null
     $monSize = $null
+    $monConn = $null
+    $monModes = $null
     try { $monId = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue } catch { }
     try { $monSize = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams -ErrorAction SilentlyContinue } catch { }
+    try { $monConn = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams -ErrorAction SilentlyContinue } catch { }
+    try { $monModes = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorListedSupportedSourceModes -ErrorAction SilentlyContinue } catch { }
 
-    # Current resolution snapshot (best-effort)
-    $resW = $null
-    $resH = $null
+    # Fallback "current resolution", shared across monitors - used only for a
+    # monitor with no listed source modes of its own.
+    $fallbackResW = $null
+    $fallbackResH = $null
     try {
         $video = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue
         if ($video) {
             $primary = $video | Sort-Object CurrentHorizontalResolution -Descending | Select-Object -First 1
-            $resW = $primary.CurrentHorizontalResolution
-            $resH = $primary.CurrentVerticalResolution
+            $fallbackResW = $primary.CurrentHorizontalResolution
+            $fallbackResH = $primary.CurrentVerticalResolution
         }
     } catch { }
 
-    $sizeByInstance = @{}
-    if ($monSize) {
-        foreach ($s in $monSize) { $sizeByInstance[$s.InstanceName] = $s }
-    }
+    $sizeByInstance  = @{}
+    if ($monSize)  { foreach ($s in $monSize)  { $sizeByInstance[$s.InstanceName]  = $s } }
+    $connByInstance  = @{}
+    if ($monConn)  { foreach ($c in $monConn)  { $connByInstance[$c.InstanceName]  = $c } }
+    $modesByInstance = @{}
+    if ($monModes) { foreach ($m in $monModes) { $modesByInstance[$m.InstanceName] = $m } }
+
+    # DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INTERNAL - reported for a built-in panel.
+    $internalVideoOutputTechnology = -2147483648
 
     if ($monId) {
         foreach ($m in $monId) {
@@ -1553,27 +2579,58 @@ function Get-DisplayInfo {
                 }
             }
 
+            # Embedded (built-in laptop/AIO panel) vs external. Fail safe: an
+            # unreadable signal defaults to embedded, so it never generates an
+            # ITFlow lookup or ticket for a laptop's own screen.
+            $isEmbedded = $true
+            if ($connByInstance.ContainsKey($inst)) {
+                try {
+                    $vot = [int64]$connByInstance[$inst].VideoOutputTechnology
+                    $isEmbedded = ($vot -eq $internalVideoOutputTechnology)
+                } catch { $isEmbedded = $true }
+            }
+
+            # This monitor's own preferred resolution, falling back to the shared
+            # "current resolution" only when it has no listed source modes.
+            $resW = $null
+            $resH = $null
+            if ($modesByInstance.ContainsKey($inst)) {
+                try {
+                    $modeInfo = $modesByInstance[$inst]
+                    $modes = @($modeInfo.MonitorSourceModes)
+                    $prefIdx = [int]$modeInfo.PreferredMonitorSourceModeIndex
+                    if ($modes.Count -gt 0 -and $prefIdx -ge 0 -and $prefIdx -lt $modes.Count) {
+                        $resW = $modes[$prefIdx].HorizontalActivePixels
+                        $resH = $modes[$prefIdx].VerticalActivePixels
+                    }
+                } catch { }
+            }
+            if (-not ($resW -and $resH)) { $resW = $fallbackResW; $resH = $fallbackResH }
+
             $displays += [pscustomobject]@{
                 FriendlyName     = if ([string]::IsNullOrWhiteSpace($friendly)) { $null } else { $friendly }
                 Manufacturer     = if ([string]::IsNullOrWhiteSpace($mfg)) { $null } else { $mfg }
-                Model            = if ([string]::IsNullOrWhiteSpace($prod)) { $null } else { $prod }
+                ProductCode      = if ([string]::IsNullOrWhiteSpace($prod)) { $null } else { $prod }
                 Serial           = if ([string]::IsNullOrWhiteSpace($serial)) { $null } else { $serial }
                 SizeInches       = $diagIn
                 NativeResolution = if ($resW -and $resH) { [pscustomobject]@{ Width = $resW; Height = $resH } } else { $null }
+                IsEmbedded       = $isEmbedded
             }
         }
     }
 
-    # Fallback when EDID isn't available
+    # Fallback when EDID isn't available at all: one synthetic entry with no
+    # identity to match against ITFlow, so it's marked embedded and never sent.
     if ($displays.Count -eq 0) {
-        if ($resW -and $resH) {
+        if ($fallbackResW -and $fallbackResH) {
             $displays += [pscustomobject]@{
                 FriendlyName     = $null
                 Manufacturer     = $null
-                Model            = $null
+                ProductCode      = $null
                 Serial           = $null
                 SizeInches       = $null
-                NativeResolution = [pscustomobject]@{ Width = $resW; Height = $resH }
+                NativeResolution = [pscustomobject]@{ Width = $fallbackResW; Height = $fallbackResH }
+                IsEmbedded       = $true
             }
         }
     }
@@ -1716,6 +2773,328 @@ function Get-FullSnapshot {
     }
 }
 
+# =====================================================
+# asset_specs (ITFlow asset details)
+# The API takes per-type details as an asset_specs object. Only the keys the
+# reference lists for a type are kept: Laptop/Desktop/Server take cpu, ram_gb,
+# storage; Virtual Machine takes vcpus, ram_gb, storage (vm_host is left to the
+# technician). Updates overlay what is sent, so only changed keys are sent.
+# =====================================================
+
+function Format-ITFlowDiskSize {
+    # Decimal units, rounded the way drives are labelled (512 GB, 1 TB, 1.9 TB).
+    param([int64]$Bytes)
+    if ($Bytes -le 0) { return "" }
+    $gb = $Bytes / 1000000000
+    if ($gb -ge 1000) {
+        $tb = [math]::Round($gb / 1000, 1)
+        if ($tb -eq [math]::Floor($tb)) { return ("{0} TB" -f [int64]$tb) }
+        return ("{0} TB" -f $tb.ToString([System.Globalization.CultureInfo]::InvariantCulture))
+    }
+    return ("{0} GB" -f [int64][math]::Round($gb, 0))
+}
+
+function Get-ITFlowAssetSpecs {
+    # Map the local snapshot to the asset_specs keys for this asset type.
+    # Returns an ordered hashtable; empty when the type has no keys we can fill.
+    param(
+        [Parameter(Mandatory=$true)]$Snapshot,
+        [string]$AssetType
+    )
+
+    $specs = [ordered]@{}
+    $isPhysical = @("Laptop","Desktop","Server") -contains $AssetType
+    $isVm = ($AssetType -eq "Virtual Machine")
+    if (-not $isPhysical -and -not $isVm) { return $specs }
+
+    $cs = $null
+    try { $cs = $Snapshot._CimComputerSystem } catch { $cs = $null }
+
+    # cpu (physical) / vcpus (VM)
+    if ($isPhysical -and $Snapshot.CPU -and -not [string]::IsNullOrWhiteSpace([string]$Snapshot.CPU.Name)) {
+        $cpuName = (([string]$Snapshot.CPU.Name) -replace '\s+', ' ').Trim()
+        $sockets = 0
+        try { if ($cs) { $sockets = [int]$cs.NumberOfProcessors } } catch { $sockets = 0 }
+        if ($sockets -gt 1) { $cpuName = "$sockets x $cpuName" }
+        $specs.cpu = $cpuName
+    }
+    if ($isVm) {
+        # Get-CpuInfo reads only the first Win32_Processor; a VM often presents one
+        # socket per vCPU, so take the total from Win32_ComputerSystem.
+        $vcpus = 0
+        try { if ($cs) { $vcpus = [int]$cs.NumberOfLogicalProcessors } } catch { $vcpus = 0 }
+        if ($vcpus -le 0 -and $Snapshot.CPU) { try { $vcpus = [int]$Snapshot.CPU.LogicalCount } catch { $vcpus = 0 } }
+        if ($vcpus -gt 0) { $specs.vcpus = $vcpus }
+    }
+
+    # ram_gb: installed modules first (TotalPhysicalMemory is net of hardware
+    # reservations, e.g. 16 GB with shared graphics reads as ~14), then fallback.
+    $ramGb = 0
+    try {
+        $mods = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop)
+        $sum = [int64]0
+        foreach ($m in $mods) { try { $sum += [int64]$m.Capacity } catch { } }
+        if ($sum -gt 0) { $ramGb = [int][math]::Round($sum / 1GB, 0) }
+    } catch { $ramGb = 0 }
+    if ($ramGb -le 0 -and $Snapshot.Memory -and $Snapshot.Memory.TotalGB) {
+        try { $ramGb = [int][math]::Round([double]$Snapshot.Memory.TotalGB, 0) } catch { $ramGb = 0 }
+    }
+    if ($ramGb -gt 0) { $specs.ram_gb = $ramGb }
+
+    # storage: internal physical disks, e.g. "512 GB SSD, 2 TB HDD". USB disks
+    # (MSFT_PhysicalDisk BusType 7, or Win32_DiskDrive InterfaceType 'USB') are
+    # removable media, not part of the machine's spec.
+    $diskParts = New-Object System.Collections.Generic.List[string]
+    if ($Snapshot.Storage -and $Snapshot.Storage.PhysicalDisks) {
+        foreach ($d in @($Snapshot.Storage.PhysicalDisks)) {
+            $bus = "$($d.BusType)"
+            if ($bus -eq "7" -or $bus -match '(?i)^usb$') { continue }
+            $size = Format-ITFlowDiskSize ([int64]$d.SizeBytes)
+            if (-not $size) { continue }
+            $media = "$($d.MediaType)"
+            if ($media -eq "SSD" -or $media -eq "HDD") { $size = "$size $media" }
+            $diskParts.Add($size) | Out-Null
+        }
+    }
+    if ($diskParts.Count -gt 0) { $specs.storage = ($diskParts -join ', ') }
+
+    return $specs
+}
+
+function Get-ITFlowDisplaySpecs {
+    # Map one Get-DisplayInfo record to the Display asset_specs keys: size_in and
+    # resolution. Returns an ordered hashtable; empty when neither is known.
+    param($Display)
+
+    $specs = [ordered]@{}
+    if ($Display.SizeInches) {
+        $sizeStr = ([double]$Display.SizeInches).ToString("0.#", [System.Globalization.CultureInfo]::InvariantCulture)
+        $specs.size_in = $sizeStr
+    }
+    if ($Display.NativeResolution -and $Display.NativeResolution.Width -and $Display.NativeResolution.Height) {
+        $specs.resolution = "$($Display.NativeResolution.Width)x$($Display.NativeResolution.Height)"
+    }
+    return $specs
+}
+
+function ConvertTo-ITFlowSpecMap {
+    # Normalise asset_specs from a read row into a hashtable. Returns $null when
+    # the row has no asset_specs property at all (a server that predates specs),
+    # so the caller can tell "no details yet" from "this server has no details".
+    # PowerShell 5.1 has no ConvertFrom-Json -AsHashtable, hence the walk.
+    param($Asset)
+
+    if ($null -eq $Asset) { return $null }
+    if (-not ($Asset.PSObject.Properties.Name -contains 'asset_specs')) { return $null }
+
+    $raw = $Asset.asset_specs
+    $map = @{}
+    if ($null -eq $raw) { return $map }
+
+    if ($raw -is [string]) {
+        $t = $raw.Trim()
+        if ($t -eq "" -or $t -eq "[]" -or $t -eq "{}") { return $map }
+        try { $raw = $t | ConvertFrom-Json -ErrorAction Stop } catch { return $map }
+    }
+    # PHP encodes an empty associative array as [] - nothing to read.
+    if ($raw -is [System.Array]) { return $map }
+
+    foreach ($p in $raw.PSObject.Properties) {
+        $map[[string]$p.Name] = Normalize-Value $p.Value
+    }
+    return $map
+}
+
+function Test-ITFlowSpecValueEqual {
+    # Numbers compare numerically ("16" vs 16 vs "16.0"); text case-insensitively
+    # with whitespace collapsed, since ITFlow may normalise either.
+    param([string]$Local, [string]$Remote)
+    $l = ($Local  -replace '\s+', ' ').Trim()
+    $r = ($Remote -replace '\s+', ' ').Trim()
+    $ld = 0.0; $rd = 0.0
+    $ci = [System.Globalization.CultureInfo]::InvariantCulture
+    $ns = [System.Globalization.NumberStyles]::Float
+    if ([double]::TryParse($l, $ns, $ci, [ref]$ld) -and [double]::TryParse($r, $ns, $ci, [ref]$rd)) {
+        return ($ld -eq $rd)
+    }
+    return ($l -eq $r)
+}
+
+function Get-ITFlowAssetSpecsDelta {
+    # Keys of $Local whose value differs from what the asset already has.
+    param($Local, $Remote)
+    $delta = [ordered]@{}
+    if (-not $Local) { return $delta }
+    foreach ($k in $Local.Keys) {
+        $lv = Normalize-Value $Local[$k]
+        $rv = ""
+        if ($Remote -and $Remote.ContainsKey($k)) { $rv = $Remote[$k] }
+        if (-not (Test-ITFlowSpecValueEqual $lv $rv)) { $delta[$k] = $Local[$k] }
+    }
+    return $delta
+}
+
+function Write-ITFlowSpecsNotKept {
+    # The server reports specs it refused (wrong key for the type, value out of
+    # range) as asset_specs_not_kept, at the top level or inside data[0].
+    param($Response, [string]$Action = "Asset update")
+    if ($null -eq $Response) { return }
+    $nk = $null
+    try { if ($Response.PSObject.Properties.Name -contains 'asset_specs_not_kept') { $nk = $Response.asset_specs_not_kept } } catch { }
+    if ($null -eq $nk) {
+        try {
+            $first = @($Response.data)[0]
+            if ($first -and $first.PSObject.Properties.Name -contains 'asset_specs_not_kept') { $nk = $first.asset_specs_not_kept }
+        } catch { }
+    }
+    if ($null -eq $nk) { return }
+
+    if ($nk -is [string]) {
+        if (-not [string]::IsNullOrWhiteSpace($nk)) { Log "ASSET SPECS NOT KEPT ($Action): $nk" }
+        return
+    }
+    if ($nk -is [System.Array]) {
+        foreach ($item in $nk) { Log "ASSET SPECS NOT KEPT ($Action): $item" }
+        return
+    }
+    foreach ($p in $nk.PSObject.Properties) {
+        Log "ASSET SPECS NOT KEPT ($Action): $($p.Name) - $($p.Value)"
+    }
+}
+
+function Sync-ITFlowDisplayAssets {
+    # Enrichment only, never creation: for each external monitor with a readable
+    # EDID serial, look for an existing Display asset with that serial in this
+    # client and update its make/model/asset_specs. A monitor with no match is
+    # left alone unless TicketUnmatchedDisplays opts into a one-time-per-serial
+    # ticket, so a technician can label/create the asset through the org's own
+    # process. Embedded panels (laptops, AIOs, tablets) are the caller's job to
+    # filter out via Display.IsEmbedded before this is reached.
+    param(
+        [Parameter(Mandatory=$true)]$Displays,
+        [Parameter(Mandatory=$true)][int]$ClientId,
+        [string]$HostHostname,
+        [string]$HostSerial,
+        [bool]$PushDisplaySpecs = $true,
+        [bool]$TicketUnmatchedDisplays = $false,
+        [bool]$TicketingEnabled = $false
+    )
+
+    if (-not $PushDisplaySpecs) { return }
+    if (-not $Displays) { return }
+
+    foreach ($display in @($Displays)) {
+        if ($display.IsEmbedded) { continue }
+        if ([string]::IsNullOrWhiteSpace($display.Serial)) { continue }
+
+        $safeSerial  = ($display.Serial -replace '[^A-Za-z0-9]', '_')
+        $seenKey     = "DisplayUnmatchedSeenAt_$safeSerial"
+        $notifiedKey = "DisplayUnmatchedNotified_$safeSerial"
+
+        $liveRow = $null
+        try {
+            $uri = New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ client_id = $ClientId; asset_serial = $display.Serial })
+            $resp = Invoke-ITFlowChecked GET $uri $null "Display asset lookup by serial"
+            if ($resp -and "$($resp.success)" -eq "True" -and $resp.count -gt 0 -and $resp.data) {
+                $sel = Select-ITFlowAssetRow -Rows $resp.data
+                # Only a live row of type Display is a match; an archived row or a
+                # live row of a different type is treated the same as "not found".
+                if ($sel.Active -and ((Get-AssetProp $sel.Active "asset_type") -eq "Display")) {
+                    $liveRow = $sel.Active
+                }
+            }
+        } catch {
+            Log "Display asset lookup failed for serial '$($display.Serial)': $($_.Exception.Message)"
+            continue
+        }
+
+        if ($liveRow) {
+            $vendor     = Get-DisplayVendorName $display.Manufacturer
+            $localMake  = Normalize-Value $vendor
+            $localModel = Normalize-Value $display.FriendlyName
+            $itMake     = Get-AssetProp $liveRow "asset_make"
+            $itModel    = Get-AssetProp $liveRow "asset_model"
+
+            $update = [ordered]@{
+                api_key   = $Config.ApiKey
+                client_id = [int]$ClientId
+                asset_id  = [int]$liveRow.asset_id
+            }
+
+            $update.asset_description = "Last Seen: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') By $HostHostname (Agent v$AgentVersion)"
+
+            if ($localMake  -and ($itMake  -ne $localMake))  { $update.asset_make  = $vendor }
+            if ($localModel -and ($itModel -ne $localModel)) { $update.asset_model = $display.FriendlyName }
+
+            $localSpecs = Get-ITFlowDisplaySpecs -Display $display
+            if ($localSpecs.Count -gt 0) {
+                $remoteSpecs = ConvertTo-ITFlowSpecMap $liveRow
+                if ($null -ne $remoteSpecs) {
+                    $specDelta = Get-ITFlowAssetSpecsDelta -Local $localSpecs -Remote $remoteSpecs
+                    if ($specDelta.Count -gt 0) { $update.asset_specs = $specDelta }
+                }
+            }
+
+            try {
+                $dresp = Invoke-ITFlow POST "$($Config.BaseUrl)/api/v1/assets/update.php" $update
+                Write-ITFlowSpecsNotKept -Response $dresp -Action "Display asset update"
+                $changedKeys = ($update.Keys | Where-Object { $_ -notin @('api_key','client_id','asset_id') }) -join ', '
+                Log "Display asset updated (serial '$($display.Serial)', asset_id $($liveRow.asset_id)): $changedKeys"
+            } catch {
+                # Invoke-ITFlow (not -Checked): a 'no rows changed' success=False
+                # answer is normal here, same reasoning as the host asset update.
+                $err = $_.Exception.Message
+                $null = Register-ITFlowFailure -Text $err -Action "Display asset update"
+                Log "Display asset update API call failed (serial '$($display.Serial)'): $err"
+            }
+
+            # Re-arm unmatched-ticket dedup in case this serial goes unmatched again later.
+            Set-CacheValue -Name $seenKey -Value ""
+            Set-CacheValue -Name $notifiedKey -Value ""
+            continue
+        }
+
+        # No live Display asset with this serial in this client.
+        if (-not $TicketUnmatchedDisplays -or -not $TicketingEnabled) { continue }
+        if ((Get-CacheValue -Name $notifiedKey -Default "") -eq "1") { continue }
+
+        $firstSeen = Get-CacheValue -Name $seenKey -Default ""
+        if ([string]::IsNullOrWhiteSpace($firstSeen)) {
+            # Seen unmatched for the first time - don't ticket yet, so a monitor
+            # that's only briefly connected (a dongle, a one-off demo) never raises
+            # a ticket from a single sync.
+            Set-CacheValue -Name $seenKey -Value (Get-Date).ToString("o")
+            Log "Display serial '$($display.Serial)' has no matching ITFlow Display asset in this client - will ticket on a later sync if still unmatched"
+            continue
+        }
+
+        $vendor = Get-DisplayVendorName $display.Manufacturer
+        $specs  = Get-ITFlowDisplaySpecs -Display $display
+        $displayPairs = [ordered]@{
+            "Detected on host" = "$HostHostname (serial $HostSerial)"
+            "Name"             = $display.FriendlyName
+            "Make"             = $vendor
+            "Serial"           = $display.Serial
+            "Size"             = $(if ($specs.size_in) { "$($specs.size_in) in" } else { $null })
+            "Resolution"       = $specs.resolution
+        }
+        $details = New-ITFlowTicketBody -Sections @(
+            (New-ITFlowTicketParagraph "No ITFlow Display asset found with serial '$($display.Serial)' in this client."),
+            (New-ITFlowTicketSection -Title "Unrecognised Display" -Icon "🖼️" -InnerHtml (New-ITFlowTicketKeyValueTable $displayPairs)),
+            (New-ITFlowTicketParagraph "If this is an org-owned external monitor, label/create a Display asset with this serial so future syncs keep it updated.")
+        )
+
+        try {
+            Create-ITFlowTicket -Title "Unrecognised external display on $HostHostname" -ClientId $ClientId -Details $details | Out-Null
+            Log "Ticketed unmatched display serial '$($display.Serial)' (host $HostHostname)"
+        } catch {
+            Log "Create ticket for unmatched display failed (serial '$($display.Serial)'): $($_.Exception.Message)"
+        }
+        # One ticket ever per serial, regardless of which host sees it next.
+        Set-CacheValue -Name $notifiedKey -Value "1"
+    }
+}
+
 function Write-LocalSysInfoFromSnapshot {
     param(
         [Parameter(Mandatory=$true)] $Snapshot,
@@ -1725,6 +3104,13 @@ function Write-LocalSysInfoFromSnapshot {
     $hostname   = $env:COMPUTERNAME
     $root       = $script:SysInfoRoot
     $archiveDir = $script:SysInfoArchiveDir
+
+    # Remediation E: never let a SYSTEM write follow a planted reparse point or
+    # write into a non-admin-owned directory (arbitrary-overwrite-as-SYSTEM).
+    if ($script:IsSystemContext -and -not (Test-SafeSystemDir -Path $root)) {
+        Log "SECURITY: sysinfo root '$root' is a reparse point or not admin-owned - skipping local sysinfo write"
+        return
+    }
 
     if (-not (Test-Path $root))       { New-Item -Path $root -ItemType Directory -Force | Out-Null }
     if (-not (Test-Path $archiveDir)) { New-Item -Path $archiveDir -ItemType Directory -Force | Out-Null }
@@ -1760,14 +3146,341 @@ function Write-LocalSysInfoFromSnapshot {
 # =====================================================
 # ITFLOW API Functions
 # =====================================================
+# =====================================================
+# ITFlow 26.08 API COMPATIBILITY
+# ---------------------------------------------------------------------------
+# 26.08 changed two things this agent depends on:
+#
+#   1. Every pre-existing API key was deleted by the update and had to be
+#      reissued. A fleet upgraded past 26.08 therefore fails authentication on
+#      every endpoint until each agent is given a new key. Without the helpers
+#      below that surfaces as a generic "HTTP request failed", five pointless
+#      30-second connectivity retries, and no indication of the real cause.
+#   2. Keys are now owned by a user and inherit that user's role, module and
+#      client permissions instead of carrying their own client scope. A key can
+#      now silently see fewer clients than the administrator intended, which
+#      matters because cross-client transfer detection reads by serial with no
+#      client_id and treats an empty result as "this asset exists nowhere".
+#
+# Keys also carry an expiry date from 26.08, so authentication can start failing
+# on a fleet that was working yesterday and was not touched.
+# =====================================================
+
+function Get-ITFlowHttpErrorDetail {
+    # Pull the HTTP status code and response body out of a failed web request.
+    # Windows PowerShell 5.1 throws a WebException carrying an HttpWebResponse
+    # whose stream still holds the JSON error body; PowerShell 7 surfaces the same
+    # body on $_.ErrorDetails.Message. ITFlow answers a rejected key with that body
+    # ("Authentication failed. API key is invalid or has expired."), so it is the
+    # only place the real reason can be read from.
+    param($ErrorRecord)
+
+    $detail = [pscustomobject]@{ StatusCode = 0; Body = "" }
+    if (-not $ErrorRecord) { return $detail }
+
+    try {
+        if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+            $detail.Body = [string]$ErrorRecord.ErrorDetails.Message
+        }
+    } catch { }
+
+    try {
+        $resp = $ErrorRecord.Exception.Response
+        if ($resp) {
+            try { $detail.StatusCode = [int]$resp.StatusCode } catch { }
+            if ([string]::IsNullOrWhiteSpace($detail.Body)) {
+                $stream = $null
+                try { $stream = $resp.GetResponseStream() } catch { $stream = $null }
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    try { $detail.Body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                }
+            }
+        }
+    } catch { }
+
+    return $detail
+}
+
+function Test-IsAuthFailureText {
+    # True when a message (exception text, or an ITFlow success=False message)
+    # indicates the key itself was rejected rather than the request being wrong.
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    # A 403 is a permission-level denial for a key that DID authenticate; it is
+    # classified separately (Get-ITFlowFailureKind) and must not read as a dead key.
+    if ($Text -match '\(HTTP 403\)' -or $Text -match '\(403\)') { return $false }
+    return (
+        $Text -match 'Authentication failed' -or
+        $Text -match 'API key is invalid' -or
+        $Text -match 'invalid or has expired' -or
+        $Text -match '\(401\)' -or
+        $Text -match '(?i)\bunauthorized\b'
+    )
+}
+
+function Set-ITFlowAuthFailure {
+    # Record a rejected key once, loudly and in one place, so the log says what to
+    # do about it instead of leaving a generic transport error behind.
+    param([string]$Reason, [string]$Action = "API call")
+
+    $script:AuthFailureReason = $Reason
+    try {
+        $script:LastRunState.AuthFailed        = $true
+        $script:LastRunState.AuthFailureReason = $Reason
+    } catch { }
+
+    Log "AUTH FAILURE ($Action): $Reason"
+    Log "AUTH: the ITFlow API rejected this key. ITFlow 26.08 deleted every key that existed before the update, and keys issued since carry an expiry date."
+    Log "AUTH: issue a new key under Admin Settings > API Keys owned by a user holding asset read/write, contact read and ticket create on this client, then save it in the agent (GUI) or re-run the installer with the new key."
+    try { Set-StateDword -Name 'LastAuthOK' -Value 0 } catch { }
+}
+
+function New-ITFlowReadUri {
+    # Build a GET URI for an api/v1 read endpoint with every value URL-escaped.
+    # Lookups match the WHOLE value, so a serial or hostname containing '&', '#',
+    # '+' or a space that is sent raw gets cut short or rewritten, reads as "not
+    # found", and the caller's next step is to create a duplicate asset.
+    # Null/empty values are omitted rather than sent as empty filters.
+    param(
+        [Parameter(Mandatory=$true)][string]$Endpoint,
+        $Query = $null
+    )
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add("api_key=" + [System.Uri]::EscapeDataString([string]$Config.ApiKey)) | Out-Null
+    if ($Query) {
+        foreach ($k in $Query.Keys) {
+            $v = $Query[$k]
+            if ($null -eq $v) { continue }
+            $sv = [string]$v
+            if ($sv -eq "") { continue }
+            $parts.Add(([System.Uri]::EscapeDataString([string]$k) + "=" + [System.Uri]::EscapeDataString($sv))) | Out-Null
+        }
+    }
+    return "$($Config.BaseUrl)/api/v1/$($Endpoint)?" + ($parts -join '&')
+}
+
+function Get-ITFlowFailureKind {
+    # Classify a failure message from Invoke-ITFlow / Invoke-ITFlowChecked using the
+    # status codes the API reference documents: 400 missing parameters, 401 missing/
+    # invalid/expired key, 403 permission denied, 405 wrong method, 500 server error.
+    # Invoke-ITFlow appends " (HTTP NNN)" to what it throws; a success=False body
+    # (HTTP 200) carries no code, so text is the fallback.
+    # Returns: Auth | Permission | BadRequest | Method | Server | Transport | None
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "None" }
+
+    $code = 0
+    if ($Text -match '\(HTTP (\d{3})\)') { $code = [int]$Matches[1] }
+    elseif ($Text -match 'error: \((\d{3})\)') { $code = [int]$Matches[1] }
+
+    if ($code -eq 401) { return "Auth" }
+    if ($code -eq 403) { return "Permission" }
+    if ($code -eq 400) { return "BadRequest" }
+    if ($code -eq 405) { return "Method" }
+    if ($code -ge 500 -and $code -le 599) { return "Server" }
+
+    if (Test-IsAuthFailureText $Text) { return "Auth" }
+    if ($Text -match '(?i)permission denied|insufficient permission|not have permission|\bforbidden\b|This needs (Read|Modify|Full) on ') { return "Permission" }
+    if ($code -gt 0) { return "Transport" }
+    if ($Text -match '(?i)HTTP request failed|timed out|unable to connect|could not be resolved|underlying connection') { return "Transport" }
+    return "None"
+}
+
+function Get-ITFlowPermissionHint {
+    # Which module/level the key's user needs for a given agent action, per the
+    # API reference: reads need Read, create/update need Modify. Assets and tickets
+    # are the Support module; clients and contacts are the Clients module.
+    param([string]$Action)
+    $a = "$Action"
+    $level = "Read"
+    if ($a -match '(?i)create|update|assign') { $level = "Modify" }
+    $module = "Support"
+    if ($a -match '(?i)contact|client|key scope') { $module = "Clients" }
+    return "$module module, $level level"
+}
+
+function Set-ITFlowPermissionFailure {
+    # The key authenticated but its user's role lacks the module level the call
+    # needs. Unlike an auth failure, other calls in the same run may still work,
+    # so this records and explains rather than aborting.
+    param([string]$Reason, [string]$Action = "API call")
+
+    $script:PermissionFailureReason = $Reason
+    try {
+        $script:LastRunState.PermissionDenied = $true
+        $script:LastRunState.PermissionReason = "${Action}: $Reason"
+    } catch { }
+
+    Log "PERMISSION DENIED ($Action): $Reason"
+    # ITFlow 26.11 states exactly what is missing: "This needs Modify on Support -
+    # the key's user, Tess Tech (Technician), has Read." Older servers say only
+    # "does not have permission", so fall back to the agent's own mapping.
+    if ($Reason -match "This needs (Read|Modify|Full) on (.+?) - the key's user, (.+?), has (\w+)") {
+        Log "PERMISSION: grant $($Matches[3]) $($Matches[1]) on $($Matches[2]) (has $($Matches[4])) under Admin > Roles - the key itself is valid, no new key is needed."
+    } else {
+        Log "PERMISSION: the key is valid but its user's role does not allow this call. Grant that user at least the $(Get-ITFlowPermissionHint $Action) (Admin > Roles) for this client."
+    }
+}
+
+function Register-ITFlowFailure {
+    # Single place that turns a failure message into the right loud log line.
+    # Returns the failure kind so callers can decide whether retrying is useful.
+    param([string]$Text, [string]$Action = "API call")
+
+    $kind = Get-ITFlowFailureKind $Text
+    switch ($kind) {
+        "Auth"       { $null = Set-ITFlowAuthFailure -Reason $Text -Action $Action }
+        "Permission" { $null = Set-ITFlowPermissionFailure -Reason $Text -Action $Action }
+        "BadRequest" { Log "API REQUEST REJECTED ($Action, HTTP 400 missing/invalid parameters): $Text" }
+        "Method"     { Log "API METHOD REJECTED ($Action, HTTP 405): $Text - the endpoint does not accept this HTTP method on this ITFlow version." }
+        default      { }
+    }
+    return $kind
+}
+
+function Get-ITFlowKeyScope {
+    # 26.08 made keys user-owned, and nothing in the API reports the resulting
+    # scope, so it is inferred from what clients/read.php will hand back. The
+    # answer decides whether an empty cross-client serial lookup can be trusted as
+    # proof that an asset exists nowhere else: with a key that can only see one
+    # client, it cannot, and treating it as proof re-creates the asset locally.
+    param([int]$ConfiguredClientId)
+
+    $scope = [pscustomobject]@{
+        ClientsReadable    = $false
+        ClientsVisible     = 0
+        SeesConfigured     = $false
+        CrossClientVisible = $false
+        Detail             = ""
+    }
+
+    try {
+        $resp = Invoke-ITFlow GET (New-ITFlowReadUri -Endpoint 'clients/read.php' -Query ([ordered]@{ limit = 100 }))
+        if ($resp -and "$($resp.success)" -eq "True" -and $resp.data) {
+            $rows = @($resp.data)
+            $scope.ClientsReadable = $true
+            $scope.ClientsVisible  = $rows.Count
+            foreach ($c in $rows) {
+                $cid = try { [int](Normalize-Value $c.client_id) } catch { 0 }
+                if ($cid -eq $ConfiguredClientId) { $scope.SeesConfigured = $true }
+            }
+            # More than one visible client is the only positive evidence available
+            # that this key is not pinned to a single client.
+            $scope.CrossClientVisible = ($rows.Count -gt 1)
+            $scope.Detail = "clients visible=$($rows.Count); configured client $ConfiguredClientId visible=$($scope.SeesConfigured)"
+        } else {
+            $msg = if ($resp -and $resp.message) { $resp.message } else { "no data returned" }
+            $scope.Detail = "clients/read returned nothing usable ($msg)"
+            $null = Register-ITFlowFailure -Text $msg -Action "Key scope probe"
+        }
+    } catch {
+        $err = $_.Exception.Message
+        $scope.Detail = "clients/read unavailable ($err)"
+        $null = Register-ITFlowFailure -Text $err -Action "Key scope probe"
+    }
+
+    return $scope
+}
+
+function Write-ITFlowKeyScopeLog {
+    param($Scope)
+    if (-not $Scope) { return }
+
+    if ($Scope.ClientsReadable) {
+        Log "API key scope: $($Scope.Detail)"
+        if (-not $Scope.SeesConfigured) {
+            Log "API key scope WARNING: the configured client is not in this key's visible client list. Asset sync will fail until the key's user is granted access to that client."
+        }
+        if (-not $Scope.CrossClientVisible) {
+            Log "API key scope NOTE: this key can see a single client, so cross-client transfer detection is degraded - an asset moved to a client this key cannot see reads as absent and will be re-created here."
+        }
+    } else {
+        Log "API key scope: undetermined ($($Scope.Detail)). The key's user may lack Clients module read; transfer detection cannot be verified this run."
+    }
+}
+
+function Write-TransferLookupScopeCaveat {
+    # Called when a cross-client lookup by serial came back empty. Before 26.08 an
+    # all-clients key made that conclusive. Now the key sees only its user's
+    # clients, so "found nowhere" may mean "found nowhere I am allowed to look" -
+    # and the caller's next move is to create the asset, i.e. a duplicate.
+    param([string]$Serial)
+
+    if ($script:ApiKeyScope -and $script:ApiKeyScope.CrossClientVisible) { return }
+
+    $seen = if ($script:ApiKeyScope -and $script:ApiKeyScope.ClientsReadable) {
+        "$($script:ApiKeyScope.ClientsVisible) client(s)"
+    } else {
+        "an undetermined set of clients"
+    }
+    Log "TRANSFER_LOOKUP_INCONCLUSIVE serial='$Serial' - this key can see $seen, so 'not found in any client' only rules out the clients it is permitted to read. If the asset was moved to a client outside that scope, enrolling now creates a duplicate. Widen the key user's client access to restore full transfer detection."
+}
+
+function Test-ITFlowApiCapabilities {
+    # Preflight used by the GUI Test API button. Since 26.08 a key inherits its
+    # user's module permissions, so "the key works" is no longer one question -
+    # asset sync, contact assignment and ticketing can each be permitted or not
+    # independently. Probes only reads; ticket create is reported as untested
+    # because testing it would raise a real ticket.
+    param([int]$ConfiguredClientId)
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $probes = @(
+        @{ Name = "Assets read (required)";   Uri = (New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ client_id = $ConfiguredClientId; limit = 1 })) },
+        @{ Name = "Contacts read (contact assignment)"; Uri = (New-ITFlowReadUri -Endpoint 'contacts/read.php' -Query ([ordered]@{ client_id = $ConfiguredClientId; limit = 1 })) },
+        @{ Name = "Clients read (transfer detection)";  Uri = (New-ITFlowReadUri -Endpoint 'clients/read.php' -Query ([ordered]@{ limit = 1 })) }
+    )
+
+    $authFailed = $false
+    foreach ($probe in $probes) {
+        $entry = [pscustomobject]@{ Name = $probe.Name; Ok = $false; Note = "" }
+        try {
+            $resp = Invoke-ITFlow GET $probe.Uri
+            if ($resp -and "$($resp.success)" -eq "True") {
+                $entry.Ok = $true
+                $entry.Note = "count=$($resp.count)"
+            } else {
+                $msg = if ($resp -and $resp.message) { $resp.message } else { "success=False" }
+                # "No resource" means permitted but empty - that is a pass for a probe.
+                if ($msg -match 'No resource') {
+                    $entry.Ok = $true
+                    $entry.Note = "permitted (no rows)"
+                } else {
+                    $kind = Get-ITFlowFailureKind $msg
+                    if ($kind -eq "Auth") { $authFailed = $true }
+                    if ($kind -eq "Permission") { $entry.Note = "permission denied (403): $msg" } else { $entry.Note = $msg }
+                }
+            }
+        } catch {
+            $err = $_.Exception.Message
+            $kind = Get-ITFlowFailureKind $err
+            if ($kind -eq "Auth") { $authFailed = $true }
+            if ($kind -eq "Permission") { $entry.Note = "permission denied (403): $err" } else { $entry.Note = $err }
+        }
+        $results.Add($entry) | Out-Null
+    }
+
+    return [pscustomobject]@{
+        AuthFailed = $authFailed
+        Probes     = $results
+    }
+}
+
 function Invoke-ITFlow {
     param($Method, $Uri, $Body = $null)
 
     try {
         if ($Body) {
+            # PS 5.1 encodes a string -Body as Latin-1 unless the ContentType
+            # charset says otherwise, corrupting any non-Latin-1 character
+            # (emoji, accents) into literal '?' bytes. Encode explicitly.
+            $json = $Body | ConvertTo-Json -Depth 6
+            $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
             Invoke-RestMethod -UseBasicParsing -Method $Method -Uri $Uri `
-                -Body ($Body | ConvertTo-Json -Depth 6) `
-                -ContentType "application/json" `
+                -Body $jsonBytes `
+                -ContentType "application/json; charset=utf-8" `
                 -TimeoutSec 90 `
                 -ErrorAction Stop
         } else {
@@ -1776,7 +3489,18 @@ function Invoke-ITFlow {
                 -ErrorAction Stop
         }
     } catch {
-        throw "HTTP request failed: $($_.Exception.Message)"
+        # Carry the HTTP status and response body into the message. A rejected key
+        # returns 401 with the reason in the body; without this the caller only
+        # ever sees "The remote server returned an error: (401) Unauthorized."
+        $detail = Get-ITFlowHttpErrorDetail $_
+        $suffix = ""
+        if ($detail.StatusCode) { $suffix += " (HTTP $($detail.StatusCode))" }
+        if (-not [string]::IsNullOrWhiteSpace($detail.Body)) {
+            $short = ($detail.Body -replace '\s+', ' ').Trim()
+            if ($short.Length -gt 300) { $short = $short.Substring(0, 300) + '...' }
+            $suffix += " body: $short"
+        }
+        throw "HTTP request failed: $($_.Exception.Message)$suffix"
     }
 }
 
@@ -1795,8 +3519,13 @@ function Invoke-ITFlowChecked {
     try {
         $resp = Invoke-ITFlow $Method $Uri $Body
     } catch {
-        Log "ITFlow API threw exception ($Action): $($_.Exception.Message)"
-        throw "ITFlow API call threw ($Action): $($_.Exception.Message)"
+        $err = $_.Exception.Message
+        # Separate "the key was rejected" (401) and "the key's user lacks the
+        # module level" (403) from every other transport failure. Neither is fixed
+        # by retrying; each is fixed by a different change in ITFlow.
+        $null = Register-ITFlowFailure -Text $err -Action $Action
+        Log "ITFlow API threw exception ($Action): $err"
+        throw "ITFlow API call threw ($Action): $err"
     }
     Throw-IfCancelRequested
 
@@ -1814,6 +3543,9 @@ function Invoke-ITFlowChecked {
             return [pscustomobject]@{ success = "True"; count = 0; data = @(); message = $msg }
         }
 
+        # A rejected key or permission denial can also arrive as HTTP 200 with success=False.
+        $null = Register-ITFlowFailure -Text $msg -Action $Action
+
         Log "ITFlow API returned failure ($Action): $msg"
         throw "ITFlow API failed ($Action): $msg"
     }
@@ -1821,6 +3553,130 @@ function Invoke-ITFlowChecked {
     return $resp
 }
 
+
+# =====================================================
+# Ticket Body HTML Helpers
+# Every ticket's -Details is built from these, so every ticket the agent
+# raises gets the same card/table look instead of a wall of escaped plain
+# text. Every helper emits only inline style="..." attributes (no <style>
+# blocks, no external resources) since the body is rendered standalone.
+# =====================================================
+
+$script:TicketAccentColor = "#6c3ce9"
+
+function Protect-ITFlowHtml {
+    # Null/blank-safe HTML encoding for one dynamic value. The table helpers
+    # below call this on every cell so call sites never hand-escape anything.
+    param([object]$Value)
+    if ($null -eq $Value) { return "" }
+    $text = [string]$Value
+    if ([string]::IsNullOrEmpty($text)) { return "" }
+    return [System.Net.WebUtility]::HtmlEncode($text)
+}
+
+function New-ITFlowTicketKeyValueTable {
+    # Renders an ordered set of label/value pairs as a compact two-column
+    # table. Blank/null values are skipped so a row never renders empty.
+    param([System.Collections.Specialized.OrderedDictionary]$Pairs)
+
+    $rows = New-Object System.Text.StringBuilder
+    $any = $false
+    foreach ($label in $Pairs.Keys) {
+        $value = $Pairs[$label]
+        if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) { continue }
+        $any = $true
+        $null = $rows.Append("<tr>")
+        $null = $rows.Append("<td style=`"padding:3px 14px 3px 0;color:#6b7280;font-size:13px;white-space:nowrap;vertical-align:top;`">$(Protect-ITFlowHtml $label)</td>")
+        $null = $rows.Append("<td style=`"padding:3px 0;color:#1f2937;font-size:13px;`">$(Protect-ITFlowHtml $value)</td>")
+        $null = $rows.Append("</tr>")
+    }
+    if (-not $any) { return "" }
+    return "<table style=`"border-collapse:collapse;margin:0;`">$($rows.ToString())</table>"
+}
+
+function New-ITFlowTicketListTable {
+    # Renders a list of same-shaped rows (one per disk/display/adapter, etc.)
+    # as a table with a header row. Each entry in $Rows is an array of cell
+    # values in the same order as $Columns.
+    param(
+        [string[]]$Columns,
+        [object[]]$Rows
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0) { return "" }
+
+    $headerCells = ($Columns | ForEach-Object {
+        "<th style=`"text-align:left;padding:5px 14px 5px 0;border-bottom:2px solid $($script:TicketAccentColor);color:#1f2937;font-size:12px;text-transform:uppercase;letter-spacing:.03em;white-space:nowrap;`">$(Protect-ITFlowHtml $_)</th>"
+    }) -join ""
+
+    $bodyRows = New-Object System.Text.StringBuilder
+    foreach ($row in $Rows) {
+        $null = $bodyRows.Append("<tr>")
+        foreach ($cell in $row) {
+            $null = $bodyRows.Append("<td style=`"padding:4px 14px 4px 0;border-bottom:1px solid #eee;color:#1f2937;font-size:13px;white-space:nowrap;`">$(Protect-ITFlowHtml $cell)</td>")
+        }
+        $null = $bodyRows.Append("</tr>")
+    }
+
+    return "<table style=`"border-collapse:collapse;margin:0;`"><thead><tr>$headerCells</tr></thead><tbody>$($bodyRows.ToString())</tbody></table>"
+}
+
+function New-ITFlowTicketParagraph {
+    # One free-text lead-in line (e.g. an explanation sentence), encoded.
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    return "<p style=`"margin:0 0 10px 0;font-size:13px;color:#1f2937;line-height:1.5;`">$(Protect-ITFlowHtml $Text)</p>"
+}
+
+function New-ITFlowTicketSection {
+    # Wraps inner HTML (from the helpers above) as one titled card: a small
+    # icon + heading with a purple underline, consistent spacing so sections
+    # stack cleanly. Returns "" (nothing rendered) when there's no content.
+    param(
+        [Parameter(Mandatory=$true)][string]$Title,
+        [string]$Icon = "",
+        [Parameter(Mandatory=$true)][string]$InnerHtml
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InnerHtml)) { return "" }
+
+    $iconPrefix = if ($Icon) { "$Icon " } else { "" }
+    return "<div style=`"margin:0 0 18px 0;`"><div style=`"font-size:13px;font-weight:600;color:#1f2937;letter-spacing:.03em;text-transform:uppercase;border-bottom:2px solid $($script:TicketAccentColor);padding-bottom:5px;margin-bottom:8px;`">$iconPrefix$(Protect-ITFlowHtml $Title)</div>$InnerHtml</div>"
+}
+
+function New-ITFlowDeviceReportBanner {
+    # A quiet divider (muted grey, thin rule, small caps) - deliberately NOT
+    # styled like New-ITFlowTicketSection's purple-underlined cards, so the
+    # device spec that follows reads as reference/footer material rather than
+    # another primary section competing with the ticket's actual purpose.
+    return "<div style=`"margin:26px 0 14px 0;padding-top:12px;border-top:1px solid #e5e7eb;`"><div style=`"font-size:11px;font-weight:600;color:#9ca3af;letter-spacing:.08em;text-transform:uppercase;`">📋 Device Report</div></div>"
+}
+
+function New-ITFlowTicketBody {
+    # Wraps one or more section/paragraph HTML blocks (already built by the
+    # helpers above) in the outer container shared by every ticket type.
+    # -DeviceSpec is optional: when given, it's appended after a de-emphasized
+    # banner so it reads as footer material below the ticket's own purpose.
+    param([string[]]$Sections, [string]$DeviceSpec = "")
+
+    $inner = ($Sections | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ""
+    if (-not [string]::IsNullOrWhiteSpace($DeviceSpec)) {
+        $inner += (New-ITFlowDeviceReportBanner) + $DeviceSpec
+    }
+    return "<div style=`"font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:640px;`">$inner</div>"
+}
+
+function ConvertFrom-ITFlowHtmlToPlainText {
+    # The device spec is HTML (for tickets); AD's Notes field needs readable
+    # plain text. Turns row/list boundaries into line breaks, strips the rest
+    # of the markup, and decodes entities.
+    param([string]$Html)
+    if ([string]::IsNullOrWhiteSpace($Html)) { return "" }
+    $text = $Html -replace '(?i)<tr[^>]*>', "`r`n" -replace '(?i)<li[^>]*>', "`r`n - " -replace '(?i)<[^>]+>', ''
+    $text = [System.Net.WebUtility]::HtmlDecode($text)
+    $lines = ($text -split "`r`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+    return ($lines -join "`r`n").Trim()
+}
 
 # =====================================================
 # Ticket Creation Function
@@ -1841,18 +3697,21 @@ function Create-ITFlowTicket {
         [string]$Details = ""
     )
 
-    # Base payload
+    # Base payload. ticket_priority is stated explicitly: 26.09 changed the default
+    # for tickets that omit it, so leaving it out makes the priority of agent tickets
+    # depend on the server version.
     $payload = @{
-        api_key        = $Config.ApiKey
-        client_id      = $ClientId
-        ticket_subject = $Title
+        api_key         = $Config.ApiKey
+        client_id       = $ClientId
+        ticket_subject  = $Title
+        ticket_priority = $(if ([string]::IsNullOrWhiteSpace($TicketPriority)) { "Low" } else { $TicketPriority })
     }
 
-    # Include ticket_details when provided (convert plaintext to HTML for web display)
+    # Include ticket_details when provided. $Details is always pre-built HTML
+    # from the ticket body helpers above (New-ITFlowTicketBody etc.), which
+    # already HTML-encode every dynamic value they embed - so it's sent as-is.
     if (-not [string]::IsNullOrWhiteSpace($Details)) {
-        $htmlDetails = $Details -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
-        $htmlDetails = $htmlDetails -replace "`r`n", "<br>" -replace "`n", "<br>"
-        $payload.ticket_details = $htmlDetails
+        $payload.ticket_details = $Details
     }
 
     # Determine best asset_id to attach (in order of preference)
@@ -1950,6 +3809,21 @@ function Clear-QueuedRename {
     } catch { }
 }
 
+function Test-InteractiveUserPresent {
+    # True if someone is logged on at the console. Used to keep the unattended
+    # auto-rename from firing (and force-rebooting) while a user is working.
+    # Console session is the right signal for 1:1 workstations (RDS is out of scope).
+    try {
+        $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        if (-not [string]::IsNullOrWhiteSpace($u)) { return $true }
+    } catch {
+        # WMI unavailable: fall through. Fail SAFE (assume present) so we never
+        # force-reboot a machine we can't inspect.
+        return $true
+    }
+    return $false
+}
+
 function Invoke-HostnameRenameSafe {
     param(
         [Parameter(Mandatory=$true)][string]$DesiredHostname,
@@ -1997,7 +3871,16 @@ function Invoke-HostnameRenameSafe {
                 $ticketTitle = "[RENAME FAILED] $($env:COMPUTERNAME) -> $DesiredHostname | Serial: $Serial | Error: $($_.Exception.Message)"
                 try { $assetIdForTicket = $script:CurrentAssetId } catch { $assetIdForTicket = $null }
                 $ticketClientId = if ($Config.ClientId) { [int]$Config.ClientId } else { 0 }
-                Create-ITFlowTicket -Title $ticketTitle -ClientId $ticketClientId -AssetId $assetIdForTicket -Details "Current Hostname: $($env:COMPUTERNAME)`nDesired Hostname: $DesiredHostname`nSerial: $Serial`nError: $($_.Exception.Message)" | Out-Null
+                $renamePairs = [ordered]@{
+                    "Current Hostname" = $env:COMPUTERNAME
+                    "Desired Hostname" = $DesiredHostname
+                    "Serial"           = $Serial
+                    "Error"            = $_.Exception.Message
+                }
+                $renameDetails = New-ITFlowTicketBody -Sections @(
+                    (New-ITFlowTicketSection -Title "Rename Failed" -Icon "⚠️" -InnerHtml (New-ITFlowTicketKeyValueTable $renamePairs))
+                )
+                Create-ITFlowTicket -Title $ticketTitle -ClientId $ticketClientId -AssetId $assetIdForTicket -Details $renameDetails | Out-Null
                 Set-TicketFlag $renameFailFlag | Out-Null
             }
         }
@@ -2033,26 +3916,44 @@ function Start-AssetEnrollment {
     Log "Enrollment (create): no existing asset found for serial '$($Inv.Serial)' - creating new asset in client_id=$EffectiveClientId"
     Log ("Enrollment (create): payload name='{0}' type='{1}' make='{2}' model='{3}' os='{4}' ip='{5}' mac='{6}' status='{7}'" -f $Inv.Hostname,$DetectedAssetType,$Inv.Make,$Inv.Model,$Inv.OS,$Inv.IP,$Inv.MAC,$DefaultAssetStatus)
 
+    $createBody = @{
+        api_key      = $Config.ApiKey
+        client_id    = [int]$EffectiveClientId
+        asset_name   = $Inv.Hostname
+        # Same check-in line the update path writes, so a new asset shows it from the first run
+        asset_description = "Last Check-In: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') (Agent v$AgentVersion)"
+        asset_serial = $Inv.Serial
+        asset_make   = $Inv.Make
+        asset_model  = $Inv.Model
+        asset_os     = $Inv.OS
+        asset_mac    = $Inv.MAC
+        asset_ip     = $Inv.IP
+        asset_type   = $DetectedAssetType
+        asset_status = $DefaultAssetStatus
+    }
+    # A server without asset_specs ignores the unknown field.
+    if ($script:LocalAssetSpecs -and $script:LocalAssetSpecs.Count -gt 0) {
+        $createBody.asset_specs = $script:LocalAssetSpecs
+    }
+
     try {
-        $result = Invoke-ITFlowChecked POST "$($Config.BaseUrl)/api/v1/assets/create.php" @{
-            api_key      = $Config.ApiKey
-            client_id    = [int]$EffectiveClientId
-            asset_name   = $Inv.Hostname
-            asset_serial = $Inv.Serial
-            asset_make   = $Inv.Make
-            asset_model  = $Inv.Model
-            asset_os     = $Inv.OS
-            asset_mac    = $Inv.MAC
-            asset_ip     = $Inv.IP
-            asset_type   = $DetectedAssetType
-            asset_status = $DefaultAssetStatus
-        } "Asset create"
+        $result = Invoke-ITFlowChecked POST "$($Config.BaseUrl)/api/v1/assets/create.php" $createBody "Asset create"
+        Write-ITFlowSpecsNotKept -Response $result -Action "Asset create"
     } catch {
         Log "Asset create failed, checking for existing serial in other clients..."
         try {
-            $globalLookup = Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&asset_serial=$($Inv.Serial)" $null "Transfer lookup by serial"
+            $globalLookup = Invoke-ITFlowChecked GET (New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ asset_serial = $Inv.Serial })) $null "Transfer lookup by serial"
+            $globalSel = $null
             if ("$($globalLookup.success)" -eq "True" -and ($globalLookup.data -and $globalLookup.data.Count -gt 0)) {
-                $moved = $globalLookup.data | Select-Object -First 1
+                $globalSel = Select-ITFlowAssetRow -Rows $globalLookup.data
+                if (-not $globalSel.Active) {
+                    Invoke-ArchivedAssetNotice -Inv $Inv -TicketClientId ([int]$EffectiveClientId) -ArchivedRow $globalSel.Archived[0] -FlagName "TransferTargetArchived" -LogTag "TRANSFER_TARGET_ARCHIVED" -DeviceSpec $DeviceSpec
+                    $script:LastSyncOK = $false
+                    return
+                }
+            }
+            if ($globalSel -and $globalSel.Active) {
+                $moved = $globalSel.Active
                 $discoveredClientId = try { [int](Normalize-Value $moved.asset_client_id) } catch { 0 }
                 $discoveredAssetId  = try { [int](Normalize-Value $moved.asset_id) } catch { 0 }
                 $followResult = Invoke-AssetTransferFollow -Inv $Inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
@@ -2064,6 +3965,7 @@ function Start-AssetEnrollment {
                     return
                 }
             } else {
+                Write-TransferLookupScopeCaveat -Serial $Inv.Serial
                 Log "Serial '$($Inv.Serial)' not found in any client. Proceeding with enrollment."
                 Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $Details -DeviceSpec $DeviceSpec -Depth ($Depth + 1)
             }
@@ -2120,77 +4022,94 @@ $script:SetAssetNameOnce = $false
     # =============================
     $snapshot = Get-FullSnapshot -AgentVersion $AgentVersion
 
-    # Build device specification block for tickets (preserved when asset is archived/deleted)
-    $dsb = New-Object System.Text.StringBuilder
+    # Build device specification block for tickets (preserved when asset is archived/deleted).
+    # Rendered as HTML cards/tables (New-ITFlowTicketSection etc.) rather than
+    # plain text, since Create-ITFlowTicket no longer re-escapes -Details itself.
+    $deviceSections = New-Object System.Collections.Generic.List[string]
+
     if ($snapshot.CPU) {
-        $null = $dsb.AppendLine("CPU")
-        $null = $dsb.AppendLine("---")
-        $null = $dsb.AppendLine("Name:       $($snapshot.CPU.Name)")
-        $null = $dsb.AppendLine("Cores:      $($snapshot.CPU.CoreCount) / $($snapshot.CPU.LogicalCount)")
-        $null = $dsb.AppendLine("Max MHz:    $($snapshot.CPU.MaxClockMHz)")
+        $cpuPairs = [ordered]@{
+            "Name"    = $snapshot.CPU.Name
+            "Cores"   = "$($snapshot.CPU.CoreCount) / $($snapshot.CPU.LogicalCount)"
+            "Max MHz" = $snapshot.CPU.MaxClockMHz
+        }
+        $deviceSections.Add((New-ITFlowTicketSection -Title "CPU" -Icon "🖥️" -InnerHtml (New-ITFlowTicketKeyValueTable $cpuPairs)))
     }
+
     if ($snapshot.Memory -and $snapshot.Memory.TotalGB) {
-        $null = $dsb.AppendLine("")
-        $null = $dsb.AppendLine("Memory")
-        $null = $dsb.AppendLine("------")
-        $null = $dsb.AppendLine("Total GB:   $($snapshot.Memory.TotalGB)")
+        $memPairs = [ordered]@{ "Total GB" = $snapshot.Memory.TotalGB }
+        $deviceSections.Add((New-ITFlowTicketSection -Title "Memory" -Icon "🧠" -InnerHtml (New-ITFlowTicketKeyValueTable $memPairs)))
     }
+
     if ($snapshot.Storage -and $snapshot.Storage.Totals) {
-        $null = $dsb.AppendLine("")
-        $null = $dsb.AppendLine("Storage")
-        $null = $dsb.AppendLine("-------")
-        $null = $dsb.AppendLine("Physical:   $($snapshot.Storage.Totals.PhysicalTotalGB) GB")
-        $null = $dsb.AppendLine("Volumes:    $($snapshot.Storage.Totals.VolumeTotalGB) GB")
+        $storagePairs = [ordered]@{
+            "Physical" = "$($snapshot.Storage.Totals.PhysicalTotalGB) GB"
+            "Volumes"  = "$($snapshot.Storage.Totals.VolumeTotalGB) GB"
+        }
+        $storageHtml = New-ITFlowTicketKeyValueTable $storagePairs
         if ($snapshot.Storage.PhysicalDisks -and $snapshot.Storage.PhysicalDisks.Count -gt 0) {
-            $null = $dsb.AppendLine("Disks:      $($snapshot.Storage.PhysicalDisks.Count)")
+            $diskRows = New-Object System.Collections.Generic.List[object]
             foreach ($disk in $snapshot.Storage.PhysicalDisks) {
-                $null = $dsb.AppendLine("")
-                $null = $dsb.AppendLine("  Model:      $($disk.Model)")
-                if ($disk.Serial) { $null = $dsb.AppendLine("  Serial:     $($disk.Serial)") }
-                $null = $dsb.AppendLine("  Size:       $([math]::Round($disk.SizeBytes / 1GB, 2)) GB")
-                $null = $dsb.AppendLine("  Media:      $($disk.MediaType)")
-                if ($disk.HealthStatus) { $null = $dsb.AppendLine("  Health:     $($disk.HealthStatus)") }
+                $diskRows.Add(@(
+                    $disk.Model,
+                    $(if ($disk.Serial) { $disk.Serial } else { "" }),
+                    "$([math]::Round($disk.SizeBytes / 1GB, 2)) GB",
+                    $disk.MediaType,
+                    $(if ($disk.HealthStatus) { $disk.HealthStatus } else { "" })
+                ))
             }
+            $storageHtml += New-ITFlowTicketListTable -Columns @("Model", "Serial", "Size", "Media", "Health") -Rows $diskRows
         }
+        $deviceSections.Add((New-ITFlowTicketSection -Title "Storage" -Icon "💾" -InnerHtml $storageHtml))
     }
+
     if ($snapshot.Displays -and $snapshot.Displays.Count -gt 0) {
-        $null = $dsb.AppendLine("")
-        $null = $dsb.AppendLine("Displays")
-        $null = $dsb.AppendLine("--------")
+        $displayRows = New-Object System.Collections.Generic.List[object]
         foreach ($display in $snapshot.Displays) {
-            $null = $dsb.AppendLine("")
-            if ($display.FriendlyName) { $null = $dsb.AppendLine("  Name:       $($display.FriendlyName)") }
-            if ($display.Manufacturer) { $null = $dsb.AppendLine("  Make:       $($display.Manufacturer)") }
-            if ($display.Model) { $null = $dsb.AppendLine("  Model:      $($display.Model)") }
-            if ($display.Serial) { $null = $dsb.AppendLine("  Serial:     $($display.Serial)") }
-            if ($display.SizeInches) { $null = $dsb.AppendLine("  Size:       $($display.SizeInches) inches") }
-            if ($display.NativeResolution) {
-                $null = $dsb.AppendLine("  Resolution: $($display.NativeResolution.Width) x $($display.NativeResolution.Height)")
-            }
+            $displayRows.Add(@(
+                $(if ($display.FriendlyName) { $display.FriendlyName } else { "" }),
+                $(if ($display.Manufacturer) { Get-DisplayVendorName $display.Manufacturer } else { "" }),
+                $(if ($display.ProductCode) { $display.ProductCode } else { "" }),
+                $(if ($display.Serial) { $display.Serial } else { "" }),
+                $(if ($display.SizeInches) { "$($display.SizeInches) in" } else { "" }),
+                $(if ($display.NativeResolution) { "$($display.NativeResolution.Width) x $($display.NativeResolution.Height)" } else { "" })
+            ))
         }
+        $displayHtml = New-ITFlowTicketListTable -Columns @("Name", "Make", "Product Code", "Serial", "Size", "Resolution") -Rows $displayRows
+        $deviceSections.Add((New-ITFlowTicketSection -Title "Displays" -Icon "🖼️" -InnerHtml $displayHtml))
     }
+
     if ($snapshot.Network -and $snapshot.Network.Adapters) {
-        $null = $dsb.AppendLine("")
-        $null = $dsb.AppendLine("Network")
-        $null = $dsb.AppendLine("-------")
+        $netRows = New-Object System.Collections.Generic.List[object]
         foreach ($adapter in $snapshot.Network.Adapters) {
-            $null = $dsb.AppendLine("")
-            $null = $dsb.AppendLine("  Name:       $($adapter.Name)")
+            $adapterLabel = $adapter.Name
             if ($adapter.InterfaceDescription -and $adapter.InterfaceDescription -ne $adapter.Name) {
-                $null = $dsb.AppendLine("  Desc:       $($adapter.InterfaceDescription)")
+                $adapterLabel = "$($adapter.Name) ($($adapter.InterfaceDescription))"
             }
-            $null = $dsb.AppendLine("  Status:     $($adapter.Status)")
-            $null = $dsb.AppendLine("  MAC:        $($adapter.MacAddress)")
-            if ($adapter.LinkSpeed) { $null = $dsb.AppendLine("  Speed:      $($adapter.LinkSpeed)") }
+            $ipParts = New-Object System.Collections.Generic.List[string]
             if ($adapter.Ips -and $adapter.Ips.Count -gt 0) {
                 foreach ($ip in $adapter.Ips) {
-                    $null = $dsb.AppendLine("  IP:         $($ip.IPAddress) /$($ip.PrefixLength) ($($ip.AddressFamily))")
-                    if ($ip.DefaultGateway) { $null = $dsb.AppendLine("  Gateway:    $($ip.DefaultGateway)") }
+                    $part = "$($ip.IPAddress)/$($ip.PrefixLength) ($($ip.AddressFamily))"
+                    if ($ip.DefaultGateway) { $part += ", gw $($ip.DefaultGateway)" }
+                    $ipParts.Add($part)
                 }
             }
+            $netRows.Add(@(
+                $adapterLabel,
+                $adapter.MacAddress,
+                $adapter.Status,
+                $(if ($adapter.LinkSpeed) { $adapter.LinkSpeed } else { "" }),
+                ($ipParts -join "; ")
+            ))
         }
+        $netHtml = New-ITFlowTicketListTable -Columns @("Adapter", "MAC", "Status", "Speed", "IP(s)") -Rows $netRows
+        $deviceSections.Add((New-ITFlowTicketSection -Title "Network" -Icon "🌐" -InnerHtml $netHtml))
     }
-    $DeviceSpec = $dsb.ToString()
+
+    # Left un-wrapped (just the concatenated section cards, not a full
+    # New-ITFlowTicketBody): every call site below combines this with its own
+    # header section(s) and wraps the result once via New-ITFlowTicketBody.
+    $DeviceSpec = ($deviceSections | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ""
 
     # Keep existing variables for minimal downstream code changes
     $inv = [pscustomobject]@{
@@ -2215,6 +4134,26 @@ $script:SetAssetNameOnce = $false
         $snapshot.Device.AssetType = $DetectedAssetType
     }
     Log "Detected Asset Type: $DetectedAssetType"
+    if ($script:LastChassisInfo) { Log-Debug "Asset type detail: $DetectedAssetType ($($script:LastChassisInfo))" }
+
+    # asset_specs for this run (empty when disabled or the type has no keys we fill)
+    $script:LocalAssetSpecs = [ordered]@{}
+    $script:AssetSpecsUnsupportedLogged = $false
+    if ($PushAssetSpecs) {
+        try {
+            $script:LocalAssetSpecs = Get-ITFlowAssetSpecs -Snapshot $snapshot -AssetType $DetectedAssetType
+        } catch {
+            Log "asset_specs collection failed (non-fatal): $($_.Exception.Message)"
+            $script:LocalAssetSpecs = [ordered]@{}
+        }
+        if ($script:LocalAssetSpecs.Count -gt 0) {
+            Log ("Local asset_specs: " + (($script:LocalAssetSpecs.Keys | ForEach-Object { "$_='$($script:LocalAssetSpecs[$_])'" }) -join ' '))
+        } else {
+            Log "Local asset_specs: none for type '$DetectedAssetType'"
+        }
+    } else {
+        Log "asset_specs push disabled (PushAssetSpecs=0)"
+    }
 
     # Effective client_id for this run (may change if asset was transferred)
     $EffectiveClientId = if ($Config.ClientId) { [int]$Config.ClientId } else { 0 }
@@ -2223,6 +4162,7 @@ $script:SetAssetNameOnce = $false
     # Reset per-run UI state (ALWAYS do this once per run)
     $script:LastRunState.TransferFollowed     = $false
     $script:LastRunState.ClientIdAutoUpdated  = $false
+    $script:LastRunState.AssetArchived        = $false
 
 
     # =============================
@@ -2258,7 +4198,7 @@ $script:SetAssetNameOnce = $false
             Throw-IfCancelRequested
             try {
                 Log "Connectivity attempt ${attempt} of ${maxAttempts}"
-                Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&limit=1" $null "Connectivity probe" | Out-Null
+                Invoke-ITFlowChecked GET (New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ limit = 1 })) $null "Connectivity probe" | Out-Null
                 $connected = $true
                 $elapsed = (Get-Date) - $startTime
                 Log "ITFlow reachable after ${attempt} attempt(s) (elapsed: $([int]$elapsed.TotalSeconds)s)"
@@ -2266,7 +4206,23 @@ $script:SetAssetNameOnce = $false
             }
             catch {
                 Throw-IfCancelRequested
-                Log "ITFlow not reachable on attempt ${attempt}: $($_.Exception.Message)"
+                $probeErr = $_.Exception.Message
+                Log "ITFlow not reachable on attempt ${attempt}: $probeErr"
+                # ITFlow 26.08: a deleted or expired key is rejected identically on
+                # every attempt. Retrying for two and a half minutes cannot fix it and
+                # only delays the log line that says what actually needs doing.
+                # Likewise 403 (permission), 400 (bad parameters) and 405 (wrong
+                # method) are deterministic answers from a reachable server. Only
+                # transport errors and 5xx are worth waiting out.
+                $probeKind = Get-ITFlowFailureKind $probeErr
+                if ($probeKind -eq "Auth") {
+                    Log "Aborting connectivity retries: the server is reachable but rejected the API key, which retrying cannot resolve."
+                    break
+                }
+                if ($probeKind -eq "Permission" -or $probeKind -eq "BadRequest" -or $probeKind -eq "Method") {
+                    Log "Aborting connectivity retries: the server is reachable and answered '$probeKind', which retrying cannot resolve."
+                    break
+                }
                 if ($attempt -lt $maxAttempts) {
                     Log "Retrying in ${sleepSeconds} seconds..."
                     Start-SleepCancelAware -Seconds $sleepSeconds
@@ -2277,17 +4233,54 @@ $script:SetAssetNameOnce = $false
 
         if (-not $connected) {
             $elapsed = (Get-Date) - $startTime
-            Log "ITFlow unavailable after ${maxAttempts} attempts (elapsed: $([int]$elapsed.TotalSeconds)s) - aborting sync"
+            if ($script:AuthFailureReason) {
+                Log "Aborting sync after $([int]$elapsed.TotalSeconds)s - ITFlow rejected the API key. See the AUTH lines above."
+            } elseif ($script:PermissionFailureReason) {
+                Log "Aborting sync after $([int]$elapsed.TotalSeconds)s - the API key's user lacks permission to read assets. See the PERMISSION lines above."
+            } else {
+                Log "ITFlow unavailable after ${maxAttempts} attempts (elapsed: $([int]$elapsed.TotalSeconds)s) - aborting sync"
+            }
             $script:LastSyncOK = $false
             return
         }
 
         Log "Connectivity check passed, starting asset sync"
 
+        # ITFlow 26.08: establish what this user-owned key can actually see before
+        # anything relies on a cross-client lookup being authoritative.
+        if ($null -eq $script:ApiKeyScope) {
+            $script:ApiKeyScope = Get-ITFlowKeyScope -ConfiguredClientId ([int]$EffectiveClientId)
+            Write-ITFlowKeyScopeLog $script:ApiKeyScope
+            try { $script:LastRunState.KeyScope = $script:ApiKeyScope.Detail } catch { }
+        }
+
         # Lookup asset by serial in the configured client
-        $lookup = Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&client_id=$EffectiveClientId&asset_serial=$($inv.Serial)" $null "Asset lookup by serial+client"
+        $lookup = Invoke-ITFlowChecked GET (New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ client_id = $EffectiveClientId; asset_serial = $inv.Serial })) $null "Asset lookup by serial+client"
 
         Log "Asset lookup returned data count: $(if ($null -ne $lookup.data) { $lookup.data.Count } else { 'null' })"
+
+        # Archived rows come back too (oldest asset_id first). Use the live asset.
+        # If this client only has archived ones, that is what an ITFlow Transfer to
+        # Client leaves behind (it copies the asset to the new client and archives
+        # the original), so run transfer detection - but never enrol a duplicate.
+        $archivedInClient = $null
+        if ("$($lookup.success)" -eq "True" -and $lookup.data -and @($lookup.data).Count -gt 0) {
+            $lookupSel = Select-ITFlowAssetRow -Rows $lookup.data
+            if ($lookupSel.Active) {
+                if ($lookupSel.Archived.Count -gt 0) {
+                    Log "Asset lookup: using active asset_id=$($lookupSel.Active.asset_id); ignoring $($lookupSel.Archived.Count) archived record(s) with the same serial"
+                }
+                [object[]]$activeRows = @($lookupSel.Active)
+                $lookup = [pscustomobject]@{ success = "True"; count = 1; data = $activeRows }
+                Clear-TicketFlag "AssetArchived"
+                Clear-TicketFlag "TransferOutOfScope"
+            } else {
+                $archivedInClient = $lookupSel.Archived[0]
+                Log "Asset lookup: only archived record(s) in client $EffectiveClientId (asset_id=$($archivedInClient.asset_id)) - checking whether it was transferred"
+                [object[]]$noRows = @()
+                $lookup = [pscustomobject]@{ success = "True"; count = 0; data = $noRows }
+            }
+        }
 
         # Loop allows one re-entry after transfer follow so rename+update happen in the same sync
         $retrySyncAfterTransfer = $false
@@ -2394,7 +4387,16 @@ $script:SetAssetNameOnce = $false
                                     $currentSerial = $inv.Serial
                                     $currentHostname = $env:COMPUTERNAME
                                     $ticketTitle = "[RENAME CONFLICT] Duplicate ITFlow asset_name '$DesiredHostname' detected. Current asset_id=$currentAssetId. Others: $otherIdsStr | Serial: $currentSerial"
-                                    $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nCurrent Asset ID: $currentAssetId`nConflicting Asset IDs: $otherIdsStr"
+                                    $conflictPairs = [ordered]@{
+                                        "Current Hostname"       = $currentHostname
+                                        "Desired Hostname"       = $DesiredHostname
+                                        "Serial"                 = $currentSerial
+                                        "Current Asset ID"       = $currentAssetId
+                                        "Conflicting Asset IDs"  = $otherIdsStr
+                                    }
+                                    $detailStr = New-ITFlowTicketBody -Sections @(
+                                        (New-ITFlowTicketSection -Title "Rename Conflict" -Icon "⚠️" -InnerHtml (New-ITFlowTicketKeyValueTable $conflictPairs))
+                                    )
                                     Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$currentAssetId) -Details $detailStr | Out-Null
                                     Set-TicketFlag $renameConflictFlag | Out-Null
                                 } else {
@@ -2446,7 +4448,16 @@ $script:SetAssetNameOnce = $false
                                     $currentSerial = $inv.Serial
                                     $currentAssetId = $asset.asset_id
                                     $ticketTitle = "[RENAME CONFLICT] AD computer account already exists for '$DesiredHostname'. Rename blocked. DN='$adDN' | Serial: $currentSerial"
-                                    $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nCurrent Asset ID: $currentAssetId`nAD DN: $adDN"
+                                    $conflictPairs = [ordered]@{
+                                        "Current Hostname" = $currentHostname
+                                        "Desired Hostname" = $DesiredHostname
+                                        "Serial"           = $currentSerial
+                                        "Current Asset ID" = $currentAssetId
+                                        "AD DN"            = $adDN
+                                    }
+                                    $detailStr = New-ITFlowTicketBody -Sections @(
+                                        (New-ITFlowTicketSection -Title "Rename Conflict" -Icon "⚠️" -InnerHtml (New-ITFlowTicketKeyValueTable $conflictPairs))
+                                    )
                                     Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$currentAssetId) -Details $detailStr | Out-Null
                                     Set-TicketFlag $renameConflictFlag | Out-Null
                                 } else {
@@ -2485,8 +4496,16 @@ $script:SetAssetNameOnce = $false
         if ($EnableTicketingGui) {
             if (-not (Test-TicketFlag $renameFlag)) {
                 $ticketTitle = "[RENAME] $currentHostname -> $DesiredHostname | Serial: $currentSerial"
-                $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nMode: GUI"
-                if ($adCleanupLog) { $detailStr += "`nAD Cleanup: $adCleanupLog" }
+                $renamePairs = [ordered]@{
+                    "Current Hostname" = $currentHostname
+                    "Desired Hostname" = $DesiredHostname
+                    "Serial"           = $currentSerial
+                    "Mode"             = "GUI"
+                    "AD Cleanup"       = $adCleanupLog
+                }
+                $detailStr = New-ITFlowTicketBody -Sections @(
+                    (New-ITFlowTicketSection -Title "Rename Queued" -Icon "✏️" -InnerHtml (New-ITFlowTicketKeyValueTable $renamePairs))
+                )
                 Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$currentAssetId) -Details $detailStr | Out-Null
                 Set-TicketFlag $renameFlag | Out-Null
             } else {
@@ -2498,15 +4517,47 @@ $script:SetAssetNameOnce = $false
     }
     else {
         if ($IsHeadlessExecution -and $AllowSilentRename) {
+            # Domain membership decides whether a signed-in user blocks the rename.
+            # The "no interactive user" rule protects the AD trust window (AD object
+            # renamed, local name waiting on a reboot). A workgroup or Entra-only
+            # machine has no on-prem AD object, so there is no window to protect -
+            # and a single passwordless account is signed in automatically at boot,
+            # so on those machines a user-free window never comes. Unknown = domain
+            # (the safe path).
+            $isDomainJoined = $true
+            try {
+                $csRename = $snapshot._CimComputerSystem
+                if ($null -eq $csRename) { $csRename = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop }
+                if ($null -ne $csRename -and $null -ne $csRename.PartOfDomain) { $isDomainJoined = [bool]$csRename.PartOfDomain }
+            } catch { $isDomainJoined = $true }
+
             $pending = Test-PendingComputerRename
             if ($pending) {
-                Log "Headless rename skipped: reboot-pending rename to '$pending' already exists"
+                if ($Reboot -and -not (Test-InteractiveUserPresent)) {
+                    # A previous run renamed the AD object but the completing reboot
+                    # never happened (cancelled/blocked). That is the trust window.
+                    # Self-heal: force the restart now while no user is present.
+                    Log "Reboot-pending rename to '$pending' found with no interactive user - forcing restart to complete it"
+                    shutdown.exe /r /t 15 /c "This PC is being renamed by IT and will restart shortly to finish. Please save any work."
+                } elseif (-not $isDomainJoined) {
+                    Log "Rename to '$pending' is pending; it applies at the next restart."
+                } else {
+                    Log "Headless rename skipped: reboot-pending rename to '$pending' already exists"
+                }
             } else {
                 if ($EnableTicketingSilent) {
                     if (-not (Test-TicketFlag $renameFlag)) {
                         $ticketTitle = "[RENAME] $currentHostname -> $DesiredHostname | Serial: $currentSerial"
-                        $detailStr = "Current Hostname: $currentHostname`nDesired Hostname: $DesiredHostname`nSerial: $currentSerial`nMode: Headless"
-                        if ($adCleanupLog) { $detailStr += "`nAD Cleanup: $adCleanupLog" }
+                        $renamePairs = [ordered]@{
+                            "Current Hostname" = $currentHostname
+                            "Desired Hostname" = $DesiredHostname
+                            "Serial"           = $currentSerial
+                            "Mode"             = "Headless"
+                            "AD Cleanup"       = $adCleanupLog
+                        }
+                        $detailStr = New-ITFlowTicketBody -Sections @(
+                            (New-ITFlowTicketSection -Title "Rename Queued" -Icon "✏️" -InnerHtml (New-ITFlowTicketKeyValueTable $renamePairs))
+                        )
                         Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -Serial $inv.Serial -Details $detailStr | Out-Null
                         Set-TicketFlag $renameFlag | Out-Null
                     } else {
@@ -2517,14 +4568,40 @@ $script:SetAssetNameOnce = $false
                 }
                 if ($renameRetryCount -ge 3) {
                     Log "Rename skipped for '$DesiredHostname' ($renameRetryCount previous failures)"
+                } elseif ($Reboot -and (Test-InteractiveUserPresent) -and -not $isDomainJoined) {
+                    # Workgroup / Entra-only machine with a signed-in user: rename now,
+                    # no forced restart. The new name applies at the next natural
+                    # reboot; the GUI shows "Rename pending - reboot required" meanwhile.
+                    Log "Workgroup machine with a signed-in user: renaming to '$DesiredHostname' now; it takes effect at the next restart (no AD object, so no trust window to protect)."
+                    $ok = Invoke-HostnameRenameSafe -DesiredHostname $DesiredHostname -Force
+                    if ($ok) {
+                        Clear-QueuedRename
+                        Set-AgentCacheValue -Name "RenameRetry_$DesiredHostname" -Value 0
+                        $script:LastRunState.RenameRequired = $false
+                        $script:LastRunState.TargetHostname = $DesiredHostname
+                        Log "Rename to '$DesiredHostname' staged - no restart forced; it completes when the user next restarts."
+                    }
+                } elseif ($Reboot -and (Test-InteractiveUserPresent)) {
+                    # Unattended auto-rename mode, but a user is at the console.
+                    # Renaming the AD object now and deferring the reboot is exactly
+                    # the domain-trust window we are trying to close, so DON'T rename.
+                    # Keep it queued; the next startup (before logon) applies it.
+                    Log "Auto-rename to '$DesiredHostname' deferred: interactive user present. Queued for the next startup (no-user) window."
+                    $script:LastRunState.RenameRequired = $true
+                    $script:LastRunState.TargetHostname = $DesiredHostname
+                    Set-StateDword -Name "LastRenameRequired" -Value 1
+                    Set-StateString -Name "LastTargetHostname" -Value $DesiredHostname
                 } else {
                     $ok = Invoke-HostnameRenameSafe -DesiredHostname $DesiredHostname -Force
                     if ($ok) {
                         Clear-QueuedRename
                         Set-AgentCacheValue -Name "RenameRetry_$DesiredHostname" -Value 0
                         if ($Reboot) {
-                            Log "Reboot requested after rename - restarting in 60 seconds"
-                            shutdown.exe /r /t 60 /c "ITFlow Agent: Rename to '$DesiredHostname' completed. Rebooting to apply."
+                            # Rename + reboot are kept atomic: force the restart now
+                            # (no interactive user present) so the local name catches
+                            # up to the AD object immediately.
+                            Log "Auto-reboot after rename (no interactive user) - restarting in 15 seconds"
+                            shutdown.exe /r /t 15 /c "This PC is being renamed by IT and will restart shortly to finish. Please save any work."
                         }
                     }
                 }
@@ -2553,7 +4630,7 @@ $script:SetAssetNameOnce = $false
                 asset_id  = [int]$asset.asset_id
             }
 
-            $update.asset_description = "Last Check-In: $lastCheckIn"
+            $update.asset_description = "Last Check-In: $lastCheckIn (Agent v$AgentVersion)"
 
             # Local normalized values
             $localStatus = Normalize-Value $DefaultAssetStatus
@@ -2580,8 +4657,29 @@ $script:SetAssetNameOnce = $false
             # blank/non-blank state of ITFlow's asset_name itself drives retry)
             if ($script:SetAssetNameOnce) { $update.asset_name = $inv.Hostname; $script:SetAssetNameOnce = $false }
 
+            # asset_specs: compared against what the read returned, and only the
+            # differing keys sent (the server overlays them). A read row with no
+            # asset_specs property means the server predates specs - skip.
+            if ($script:LocalAssetSpecs -and $script:LocalAssetSpecs.Count -gt 0) {
+                $remoteSpecs = ConvertTo-ITFlowSpecMap $asset
+                if ($null -eq $remoteSpecs) {
+                    if (-not $script:AssetSpecsUnsupportedLogged) {
+                        Log "asset_specs: not present in this server's asset read - skipping (ITFlow version without asset details)"
+                        $script:AssetSpecsUnsupportedLogged = $true
+                    }
+                } else {
+                    $specDelta = Get-ITFlowAssetSpecsDelta -Local $script:LocalAssetSpecs -Remote $remoteSpecs
+                    if ($specDelta.Count -gt 0) {
+                        $update.asset_specs = $specDelta
+                        Log ("asset_specs changed: " + (($specDelta.Keys | ForEach-Object { "$_ '$($remoteSpecs[$_])' -> '$($specDelta[$_])'" }) -join '; '))
+                    }
+                }
+            }
+
             # ===== MAC/IP WRITE-ONLY =====
-            # - Do NOT read/compare from ITFlow (API does not return these fields on your instance).
+            # - Do NOT read/compare from ITFlow: a filtered assets/read (by serial, name
+            #   or id) does not join the primary interface, so interface_mac/ip are absent
+            #   from the row this compares against (ITFlow 26.11 api/v1/assets/read.php).
             # - Track last-sent values locally; include MAC/IP on any update.
             $localMac = Normalize-Value $inv.MAC
             $localIp  = Normalize-Value $inv.IP
@@ -2603,11 +4701,17 @@ $script:SetAssetNameOnce = $false
                 try {
                     $resp = Invoke-ITFlow POST "$($Config.BaseUrl)/api/v1/assets/update.php" $update
                 } catch {
-                    Log "Asset update API call failed: $($_.Exception.Message)"
+                    # Invoke-ITFlow (not -Checked) because success=False 'no rows
+                    # changed' is a normal answer here, but a thrown 401/403 still
+                    # needs to be named as a key or permission problem.
+                    $err = $_.Exception.Message
+                    $null = Register-ITFlowFailure -Text $err -Action "Asset update"
+                    Log "Asset update API call failed: $err"
                     $resp = $null
                 }
                 if ($resp) {
                 Log ("Asset update API response: " + ($resp | ConvertTo-Json -Depth 4 -Compress))
+                Write-ITFlowSpecsNotKept -Response $resp -Action "Asset update"
                 }
 
                 if ($resp -and "$($resp.success)" -eq "True") {
@@ -2622,23 +4726,193 @@ $script:SetAssetNameOnce = $false
                     $msg = if ($resp -and $resp.message) { $resp.message } else { "" }
                     if ($msg -match 'no rows changed') {
                         Log "Asset already up to date (server returned 'no rows changed')."
+                    } elseif ($msg) {
+                        $null = Register-ITFlowFailure -Text $msg -Action "Asset update"
+                        Log "Asset update failed: $msg"
                     }
                 }
             }
         }
+
+        # ===== Dynamic Contact Assignment =====
+        if ($AssignContactFromLogons) {
+            $allowedDomains = @()
+            $rawDomains = @()
+            if ($AssignContactAllowedDomain) {
+                $rawDomains = $AssignContactAllowedDomain -split ','
+            } else {
+                try {
+                    $cs = Get-WmiObject Win32_ComputerSystem -ErrorAction Stop
+                    if ($cs.PartOfDomain) {
+                        $rawDomains += $cs.Domain
+                        Log "Allowed domain auto-detected: $($cs.Domain)"
+                    }
+                } catch {
+                    Log "WARN: Could not detect domain membership: $($_.Exception.Message)"
+                }
+                $rawDomains += 'AzureAD'
+            }
+            foreach ($d in $rawDomains) {
+                $d = $d.Trim()
+                if ($d) {
+                    $allowedDomains += $d
+                    $short = ($d -split '\.')[0]
+                    if ($short -and $short -ne $d) { $allowedDomains += $short }
+                }
+            }
+            $allowedDomains = $allowedDomains | Select-Object -Unique
+            Log "Allowed domains for logon filtering: $($allowedDomains -join ', ')"
+            $durations = Get-UserLogonDurations -LookbackDays $AssignContactLookbackDays -AllowedDomains $allowedDomains -HalfLifeDays $AssignContactHalfLifeDays
+            Log-Debug "RESULT: count=$(@($durations).Count)"
+            if ($durations -and $durations.Count -gt 0) {
+                $topUser = $durations[0]
+
+                # Hysteresis: don't reassign on a transient logon. Keep the current
+                # primary user unless the new leader clears the incumbent's *current*
+                # weighted score by a margin. If the incumbent no longer appears
+                # (device genuinely handed over), switch immediately.
+                $marginFactor = 1.25
+                $lastPrimaryUser = Get-AgentCacheValue -Name "PrimaryUser" -Default ""
+                $effectiveUser = $topUser
+                if ($lastPrimaryUser -and $lastPrimaryUser -ne $topUser.UserName) {
+                    $incumbent = $durations | Where-Object { $_.UserName -eq $lastPrimaryUser } | Select-Object -First 1
+                    if ($incumbent) {
+                        if ($topUser.WeightedMinutes -lt ($incumbent.WeightedMinutes * $marginFactor)) {
+                            Log "Primary-user change held by hysteresis: $($topUser.UserName) ($($topUser.WeightedMinutes)m) has not cleared $marginFactor x incumbent $lastPrimaryUser ($($incumbent.WeightedMinutes)m)"
+                            $effectiveUser = $incumbent
+                        } else {
+                            Log "Primary user changing: $lastPrimaryUser -> $($topUser.UserName) (cleared ${marginFactor}x margin)"
+                        }
+                    } else {
+                        Log "Previous primary user $lastPrimaryUser no longer active; switching to $($topUser.UserName)"
+                    }
+                }
+                Set-AgentCacheValue -Name "PrimaryUser" -Value $effectiveUser.UserName
+                Log "Primary user by weighted logon time: $($effectiveUser.DomainName)\$($effectiveUser.UserName) (weighted $($effectiveUser.WeightedMinutes)m / raw $($effectiveUser.TotalMinutes)m)"
+
+                # AD userPrincipalName/mail are matched first inside Get-ITFlowContactByUser;
+                # this constructed domain is only the fallback when AD is unreachable.
+                $emailDomain = ($allowedDomains | Where-Object { $_ -like '*.*' } | Select-Object -First 1)
+                if (-not $emailDomain) { $emailDomain = $effectiveUser.DomainName }
+                Log "Contact lookup for $($effectiveUser.UserName) (AD UPN/mail preferred; fallback domain: $emailDomain)"
+                $contactId = Get-ITFlowContactByUser -UserName $effectiveUser.UserName -DomainName $emailDomain -ClientId $EffectiveClientId
+                $lastAssignedContactId = Get-AgentCacheValue -Name "LastAssignedContactId" -Default ""
+
+                # Stable dedup key for the "contact missing" ticket: one per asset + primary user.
+                $userKey = ($effectiveUser.UserName.ToLower() -replace '[^a-z0-9]', '')
+                if ($userKey.Length -gt 40) { $userKey = $userKey.Substring(0, 40) }
+                $missingContactFlag = "ContactMissing_$($asset.asset_id)_$userKey"
+
+                if ($contactId -and "$contactId" -ne "$lastAssignedContactId") {
+                    $assignResult = Set-ITFlowAssetContact -AssetId $asset.asset_id -ContactId $contactId -ClientId $EffectiveClientId
+                    Log-Debug "Set-ITFlowAssetContact returned: $assignResult"
+                    # Contact now exists and is assigned - retire any open missing-contact ticket flag.
+                    if ($assignResult) { Clear-TicketFlag -Name $missingContactFlag }
+                } elseif ($contactId) {
+                    Log-Debug "Contact ID $contactId already assigned to this asset, skipping update"
+                    Clear-TicketFlag -Name $missingContactFlag
+                } else {
+                    # ===== v7.5.5: Missing-contact ticket =====
+                    # The device exists in ITFlow as an asset, but its primary user has no
+                    # matching contact. Raise a ticket so a tech can create the contact and
+                    # set it as the asset's primary. Fires whenever contact assignment is
+                    # enabled (independent of the general ticketing toggle) and is deduped
+                    # per asset + user via a ticket flag, cleared once a contact is assigned.
+                    Log "No matching ITFlow contact found for primary user $($effectiveUser.DomainName)\$($effectiveUser.UserName)"
+                    if (Test-TicketFlag -Name $missingContactFlag) {
+                        Log-Debug "Missing-contact ticket already raised ($missingContactFlag) - not duplicating"
+                    } else {
+                        # Rebuild the email candidates that were tried, for the ticket body.
+                        $triedEmails = New-Object System.Collections.Generic.List[string]
+                        foreach ($e in (Get-ADUserEmailCandidates -SamAccountName $effectiveUser.UserName)) {
+                            if ($e -and -not $triedEmails.Contains($e)) { $triedEmails.Add($e) }
+                        }
+                        if ($effectiveUser.UserName -like '*@*' -and -not $triedEmails.Contains($effectiveUser.UserName)) { $triedEmails.Add($effectiveUser.UserName) }
+                        $fallbackEmail = "$($effectiveUser.UserName)@$emailDomain"
+                        if (-not $triedEmails.Contains($fallbackEmail)) { $triedEmails.Add($fallbackEmail) }
+
+                        $userPairs = [ordered]@{
+                            "Username"       = "$($effectiveUser.DomainName)\$($effectiveUser.UserName)"
+                            "Weighted usage" = "$($effectiveUser.WeightedMinutes) min (raw $($effectiveUser.TotalMinutes) min) over the last $AssignContactLookbackDays days"
+                        }
+                        $triedEmailItems = ($triedEmails | ForEach-Object { "<li>$(Protect-ITFlowHtml $_)</li>" }) -join ""
+                        $triedEmailsHtml = "<p style=`"margin:8px 0 0 0;font-size:13px;color:#6b7280;`">Email lookups tried (none matched a contact):</p><ul style=`"margin:4px 0 0 0;padding-left:18px;font-size:13px;color:#1f2937;`">$triedEmailItems</ul>"
+                        $devicePairs = [ordered]@{
+                            "Hostname"   = $inv.Hostname
+                            "Serial"     = $inv.Serial
+                            "Make/Model" = "$($inv.Make) / $($inv.Model)"
+                            "Asset ID"   = $asset.asset_id
+                        }
+
+                        $tb = New-ITFlowTicketBody -Sections @(
+                            (New-ITFlowTicketParagraph "The ITFlow agent identified a primary user for this device, but no matching contact exists in ITFlow. The device is already recorded as an asset; please create the contact (or correct their email) and set them as this asset's primary contact."),
+                            (New-ITFlowTicketSection -Title "Primary User" -Icon "👤" -InnerHtml ((New-ITFlowTicketKeyValueTable $userPairs) + $triedEmailsHtml)),
+                            (New-ITFlowTicketSection -Title "Device" -Icon "🖥️" -InnerHtml (New-ITFlowTicketKeyValueTable $devicePairs)),
+                            (New-ITFlowTicketParagraph "Suggested action: create or verify the contact above under this client, then set them as the asset's primary contact. The agent stops raising this ticket once a matching contact is assigned.")
+                        )
+
+                        $ticketTitle = "Primary contact missing for $($inv.Hostname): $($effectiveUser.UserName)"
+                        $ticketResp = Create-ITFlowTicket -Title $ticketTitle -ClientId $EffectiveClientId -AssetId ([int]$asset.asset_id) -Details $tb
+                        if ($ticketResp) {
+                            Set-TicketFlag -Name $missingContactFlag | Out-Null
+                            Log "Missing-contact ticket raised for $($effectiveUser.UserName) (asset $($asset.asset_id))"
+                        } else {
+                            Log "Missing-contact ticket creation failed for $($effectiveUser.UserName); will retry next sync"
+                        }
+                    }
+                }
+            } else {
+                Log-Debug "No logon duration data to assign a contact"
+            }
+        } else {
+            Log-Debug "Contact assignment disabled (AssignContactFromLogons=$AssignContactFromLogons)"
+        }
+
         $retrySyncAfterTransfer = $false
     }
     else {
-        Log "Asset not found in configured client, checking for transferred copy..."
+        if ($archivedInClient) {
+            Log "Asset archived in configured client, checking for a live transferred copy..."
+        } else {
+            Log "Asset not found in configured client, checking for transferred copy..."
+        }
         $foundTransferred = $false
         try {
-            $transferLookup = Invoke-ITFlowChecked GET "$($Config.BaseUrl)/api/v1/assets/read.php?api_key=$($Config.ApiKey)&asset_serial=$($inv.Serial)" $null "Transfer lookup by serial"
+            $transferLookup = Invoke-ITFlowChecked GET (New-ITFlowReadUri -Endpoint 'assets/read.php' -Query ([ordered]@{ asset_serial = $inv.Serial })) $null "Transfer lookup by serial"
             $foundTransferred = "$($transferLookup.success)" -eq "True" -and ($transferLookup.data -and $transferLookup.data.Count -gt 0)
         } catch {
             Log "Transfer lookup: serial not found in any client"
         }
+        $transferSel = $null
         if ($foundTransferred) {
-            $moved = $transferLookup.data | Select-Object -First 1
+            $transferSel = Select-ITFlowAssetRow -Rows $transferLookup.data
+            if (-not $transferSel.Active) {
+                if ($archivedInClient) {
+                    # This client's record is archived and no live copy is visible:
+                    # transferred out of this key's scope, or simply archived.
+                    Invoke-ArchivedInClientDecision -Inv $inv -ClientId ([int]$EffectiveClientId) -ArchivedRow $archivedInClient -DeviceSpec $DeviceSpec
+                } else {
+                    # Only an archived record elsewhere: following it would sync into an
+                    # archived asset, and enrolling would duplicate its serial.
+                    Invoke-ArchivedAssetNotice -Inv $inv -TicketClientId ([int]$EffectiveClientId) -ArchivedRow $transferSel.Archived[0] -FlagName "TransferTargetArchived" -LogTag "TRANSFER_TARGET_ARCHIVED" -DeviceSpec $DeviceSpec
+                }
+                $script:LastSyncOK = $false
+                return
+            }
+            # A live copy exists (for an ITFlow transfer: the new asset in the new
+            # client, the archived original here being ignored) - follow it.
+            Clear-TicketFlag "TransferTargetArchived"
+            Clear-TicketFlag "AssetArchived"
+            Clear-TicketFlag "TransferOutOfScope"
+        } elseif ($archivedInClient) {
+            # Transfer lookup failed or saw nothing, yet this client has an archived
+            # record for the serial: never fall through to enrolment.
+            Invoke-ArchivedInClientDecision -Inv $inv -ClientId ([int]$EffectiveClientId) -ArchivedRow $archivedInClient -DeviceSpec $DeviceSpec
+            $script:LastSyncOK = $false
+            return
+        }
+        if ($foundTransferred) {
+            $moved = $transferSel.Active
             $discoveredClientId = try { [int](Normalize-Value $moved.asset_client_id) } catch { 0 }
             $discoveredAssetId  = try { [int](Normalize-Value $moved.asset_id) } catch { 0 }
             $followResult = Invoke-AssetTransferFollow -Inv $inv -DiscoveredClientId $discoveredClientId -DiscoveredAssetId $discoveredAssetId -DeviceSpec $DeviceSpec
@@ -2652,21 +4926,19 @@ $script:SetAssetNameOnce = $false
                 return
             }
         } else {
-            $sb = New-Object System.Text.StringBuilder
-            $null = $sb.AppendLine("Device Information")
-            $null = $sb.AppendLine("==================")
-            $null = $sb.AppendLine("Hostname:   $($snapshot.Device.Hostname)")
-            $null = $sb.AppendLine("Serial:     $($snapshot.Device.Serial)")
-            $null = $sb.AppendLine("Make/Model: $($snapshot.Device.Make) / $($snapshot.Device.Model)")
-            $null = $sb.AppendLine("OS:         $($snapshot.Device.OS)")
-            $null = $sb.AppendLine("Type:       $($snapshot.Device.AssetType)")
-            $null = $sb.AppendLine("MAC:        $($snapshot.Device.PrimaryMAC)")
-            $null = $sb.AppendLine("IP:         $($snapshot.Device.PrimaryIP)")
-            $null = $sb.AppendLine("")
-            $null = $sb.AppendLine("Device specification")
-            $null = $sb.AppendLine("--------------------")
-            $null = $sb.Append($DeviceSpec)
-            $enrollDetails = $sb.ToString()
+            Write-TransferLookupScopeCaveat -Serial $inv.Serial
+            $enrollPairs = [ordered]@{
+                "Hostname"   = $snapshot.Device.Hostname
+                "Serial"     = $snapshot.Device.Serial
+                "Make/Model" = "$($snapshot.Device.Make) / $($snapshot.Device.Model)"
+                "OS"         = $snapshot.Device.OS
+                "Type"       = $snapshot.Device.AssetType
+                "MAC"        = $snapshot.Device.PrimaryMAC
+                "IP"         = $snapshot.Device.PrimaryIP
+            }
+            $enrollDetails = New-ITFlowTicketBody -DeviceSpec $DeviceSpec -Sections @(
+                (New-ITFlowTicketSection -Title "Device Information" -Icon "🆕" -InnerHtml (New-ITFlowTicketKeyValueTable $enrollPairs))
+            )
             $retrySyncAfterTransfer = $false
             Start-AssetEnrollment -Inv $inv -DetectedAssetType $DetectedAssetType -EffectiveClientId $EffectiveClientId -Details $enrollDetails -DeviceSpec $DeviceSpec
         }
@@ -2683,6 +4955,16 @@ $script:SetAssetNameOnce = $false
 
     # Device Report trigger (GPO registry key)
     Invoke-DeviceReportCheck -Hostname $inv.Hostname -Serial $inv.Serial -ClientId $EffectiveClientId -DeviceSpec $DeviceSpec
+
+    # Enrichment only: match external monitors to existing ITFlow Display assets
+    # and update make/model/asset_specs. Never creates an asset - see
+    # Sync-ITFlowDisplayAssets for the matching rules.
+    try {
+        $displayTicketingEnabled = (($Silent -and $EnableTicketingSilent) -or (-not $Silent -and $EnableTicketingGui))
+        Sync-ITFlowDisplayAssets -Displays $snapshot.Displays -ClientId ([int]$EffectiveClientId) -HostHostname $inv.Hostname -HostSerial $inv.Serial -PushDisplaySpecs $PushDisplaySpecs -TicketUnmatchedDisplays $TicketUnmatchedDisplays -TicketingEnabled $displayTicketingEnabled
+    } catch {
+        Log "Sync-ITFlowDisplayAssets threw (non-fatal): $($_.Exception.Message)"
+    }
 
     # Persist success flag for silent-mode retry logic
     $script:LastSyncOK = $true
@@ -2704,7 +4986,12 @@ function Install-ITFlowScheduledTask {
     $resolvedPath = try { [System.IO.Path]::GetFullPath($scriptPath) } catch { $null }
     if (-not $resolvedPath) { Log "ERROR: Invalid -TaskScriptPath '$scriptPath'"; return $false }
 
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$resolvedPath`" -Silent -Rename -Worker" -WorkingDirectory (Split-Path $resolvedPath -Parent)
+    # -Reboot puts the startup sync in unattended auto-rename mode: when a rename
+    # is required it renames and immediately restarts (only if no interactive user
+    # is present), so the AD object rename and the local reboot that completes it
+    # happen back-to-back. This avoids the domain-trust window that opens when a
+    # renamed-in-AD machine sits pending-reboot waiting for a user who never restarts.
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$resolvedPath`" -Silent -Rename -Reboot -Worker" -WorkingDirectory (Split-Path $resolvedPath -Parent)
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Compatibility Win8 -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
     $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -2812,7 +5099,16 @@ if ($Install) {
     }
 
     try { Write-ConfigToRegistry | Out-Null; Log "Registry config written" } catch { Log "Registry config write failed: $($_.Exception.Message)" }
-    try { if (-not (Test-Path $installDir)) { New-Item -Path $installDir -ItemType Directory -Force | Out-Null }; Copy-Item -Path $PSCommandPath -Destination $installPath -Force -ErrorAction Stop; Log "Script copied to $installPath" } catch { Log "ERROR: Failed to copy script: $($_.Exception.Message)" }
+    try {
+        # SECURITY (v7.5.5): reset a planted reparse point and lock down the install
+        # directory owner+DACL *before* trusting it, then copy in the script and
+        # harden the file too. Converts "any user + reboot = SYSTEM" into
+        # "requires admin to tamper".
+        Protect-InstallPath -InstallDir $installDir
+        Copy-Item -Path $PSCommandPath -Destination $installPath -Force -ErrorAction Stop
+        Set-ITFlowHardenedAcl -Path $installPath | Out-Null
+        Log "Script copied to $installPath (hardened ACL applied)"
+    } catch { Log "ERROR: Failed to copy script: $($_.Exception.Message)" }
     if (-not $TaskScriptPath) { $TaskScriptPath = $installPath }
     Install-ITFlowScheduledTask
     try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop | Out-Null } catch { try { schtasks.exe /run /tn $TaskName *>$null } catch { Log "Task trigger fallback failed: $($_.Exception.Message)" } }
@@ -2834,7 +5130,33 @@ $EnableTicketingSilent = $script:EnableTicketingGui
 $EnableRenameFailureTicketing = $script:EnableTicketingGui
 # Read transfer/update preferences early too (worker doesn't reach the form section)
 $AllowFollowClientTransfer = (Get-PreferenceDword -Name "FollowClientTransfers" -Default 1) -ne 0
+$PushAssetSpecs = (Get-PreferenceDword -Name "PushAssetSpecs" -Default 1) -ne 0
+$PushDisplaySpecs = (Get-PreferenceDword -Name "PushDisplaySpecs" -Default 1) -ne 0
+$TicketUnmatchedDisplays = (Get-PreferenceDword -Name "TicketUnmatchedDisplays" -Default 0) -ne 0
 $AutoUpdateClientIdOnTransfer = (Get-PreferenceDword -Name "AutoUpdateClientIdOnTransfer" -Default 1) -ne 0
+
+# Dynamic Contact Assignment preferences
+$AssignContactFromLogons = (Get-PreferenceDword -Name "AssignContactFromLogons" -Default 0) -ne 0
+$AssignContactLookbackDays = (Get-PreferenceDword -Name "AssignContactLookbackDays" -Default 90)
+$AssignContactHalfLifeDays = (Get-PreferenceDword -Name "AssignContactHalfLifeDays" -Default 14)
+$AssignContactAllowedDomain = Get-PreferenceString -Name "AssignContactAllowedDomain" -Default ""
+$VerboseLogging = (Get-PreferenceDword -Name "VerboseLogging" -Default 0) -ne 0
+# =====================================================
+# REMEDIATION C: RUNTIME SELF-DEFENCE (SYSTEM run only)
+# Before the SYSTEM/startup task does any privileged work, verify the running
+# script cannot be modified by a non-administrator. If it can, refuse to run
+# (log and skip the sync) so a tampered script never executes as SYSTEM. GUI and
+# portable runs are never SYSTEM, so they are unaffected.
+# =====================================================
+if ($script:IsSystemContext) {
+    if (-not (Test-ScriptIntegrity -Path $PSCommandPath)) {
+        Log "SECURITY: aborting SYSTEM run - script integrity check failed for '$PSCommandPath'. Re-run install as administrator to restore a safe ACL."
+        $script:LastSyncOK = $false
+        try { Set-StateDword -Name 'LastSyncOK' -Value 0 } catch { }
+        Exit-WithMutexRelease 1
+    }
+    Log-Debug "Script integrity check passed for SYSTEM run"
+}
 
 # =====================================================
 # SILENT MODE (NO GUI)
@@ -2885,8 +5207,15 @@ $form.Size = New-Object Drawing.Size(900, 600)
 # =====================================================
 $script:EnableTicketingGui     = (Get-PreferenceDword -Name "CreateTicketsGui" -Default 1) -ne 0
 $AllowFollowClientTransfer     = (Get-PreferenceDword -Name "FollowClientTransfers" -Default 1) -ne 0
+$PushAssetSpecs                = (Get-PreferenceDword -Name "PushAssetSpecs" -Default 1) -ne 0
+$PushDisplaySpecs              = (Get-PreferenceDword -Name "PushDisplaySpecs" -Default 1) -ne 0
+$TicketUnmatchedDisplays       = (Get-PreferenceDword -Name "TicketUnmatchedDisplays" -Default 0) -ne 0
 $AutoUpdateClientIdOnTransfer  = (Get-PreferenceDword -Name "AutoUpdateClientIdOnTransfer" -Default 1) -ne 0
-
+$AssignContactFromLogons       = (Get-PreferenceDword -Name "AssignContactFromLogons" -Default 0) -ne 0
+$AssignContactLookbackDays     = (Get-PreferenceDword -Name "AssignContactLookbackDays" -Default 90)
+$AssignContactHalfLifeDays     = (Get-PreferenceDword -Name "AssignContactHalfLifeDays" -Default 14)
+$AssignContactAllowedDomain     = Get-PreferenceString -Name "AssignContactAllowedDomain" -Default ""
+$VerboseLogging                 = (Get-PreferenceDword -Name "VerboseLogging" -Default 0) -ne 0
 # =====================================================
 # Root layout: Header / Status / Details (details row collapses to 0 when hidden)
 # =====================================================
@@ -3748,7 +6077,7 @@ $btnConfig.Add_Click({
 
     $cForm = New-Object Windows.Forms.Form
     $cForm.Text = "Config"
-    $cForm.Size = New-Object Drawing.Size(520,360)
+    $cForm.Size = New-Object Drawing.Size(520,520)
     $cForm.StartPosition = 'CenterParent'
     $cForm.FormBorderStyle = 'FixedDialog'
     $cForm.MaximizeBox = $false
@@ -3815,6 +6144,59 @@ $btnConfig.Add_Click({
     $cbAuto.Checked = $AutoUpdateClientIdOnTransfer
     $gbAgent.Controls.Add($cbAuto)
 
+    # ---- User Assignment from Logon Activity
+    $gbUser = New-Object Windows.Forms.GroupBox
+    $gbUser.Text = "User Assignment"
+    $gbUser.Dock = 'Top'
+    $gbUser.Height = 155
+    $gbUser.Padding = New-Object Windows.Forms.Padding(10,20,10,10)
+    $gbUser.Margin = New-Object Windows.Forms.Padding(0,10,0,0)
+    $panel.Controls.Add($gbUser)
+
+    $cbAssign = New-Object Windows.Forms.CheckBox
+    $cbAssign.Text = "Assign Contact from Logon Activity"
+    $cbAssign.AutoSize = $true
+    $cbAssign.Location = New-Object Drawing.Point(14,28)
+    $cbAssign.Checked = $AssignContactFromLogons
+    $gbUser.Controls.Add($cbAssign)
+
+    $toolTip.SetToolTip($cbAssign, "Automatically assign ITFlow contact based on Windows Security Event log session duration.")
+
+    Add-Label $gbUser "Lookback Days:" 14 60 | Out-Null
+    $udLookback = New-Object Windows.Forms.NumericUpDown
+    $udLookback.Minimum = 1
+    $udLookback.Maximum = 365
+    $udLookback.Value = $AssignContactLookbackDays
+    $udLookback.Location = New-Object Drawing.Point(150, 58)
+    $udLookback.Size = New-Object Drawing.Size(80, 20)
+    $gbUser.Controls.Add($udLookback)
+    $toolTip.SetToolTip($udLookback, "How far back to scan the Security log for logon activity.")
+
+    Add-Label $gbUser "Half-life Days:" 250 60 | Out-Null
+    $udHalfLife = New-Object Windows.Forms.NumericUpDown
+    $udHalfLife.Minimum = 0
+    $udHalfLife.Maximum = 365
+    $udHalfLife.Value = $AssignContactHalfLifeDays
+    $udHalfLife.Location = New-Object Drawing.Point(360, 58)
+    $udHalfLife.Size = New-Object Drawing.Size(70, 20)
+    $gbUser.Controls.Add($udHalfLife)
+    $toolTip.SetToolTip($udHalfLife, "Recency weighting: recent usage counts more, so a device that changes hands re-assigns within a few half-lives. 0 = flat cumulative total (no decay).")
+
+    Add-Label $gbUser "Allowed Domain:" 14 90 | Out-Null
+    $tDomain = Add-Textbox $gbUser 150 87 330
+    $tDomain.Text = $AssignContactAllowedDomain
+
+    $toolTip.SetToolTip($tDomain, "Only consider users from this domain (e.g. COMPANY). Leave blank to allow all domains.")
+
+    $cbVerbose = New-Object Windows.Forms.CheckBox
+    $cbVerbose.Text = "Verbose Logging (debug)"
+    $cbVerbose.AutoSize = $true
+    $cbVerbose.Location = New-Object Drawing.Point(14, 120)
+    $cbVerbose.Checked = $VerboseLogging
+    $gbUser.Controls.Add($cbVerbose)
+
+    $toolTip.SetToolTip($cbVerbose, "Enable detailed debug logging for event log analysis and contact matching.")
+
     # ---- Non-admin note (preferences may not persist)
     $lblNote = New-Object Windows.Forms.Label
     $lblNote.AutoSize = $true
@@ -3836,7 +6218,7 @@ $btnConfig.Add_Click({
     $btnSave.Width = 90
     $btnSave.Height = 30
     $btnSave.Anchor = "Bottom,Right"
-    $btnSave.Location = New-Object Drawing.Point(310, 280)
+    $btnSave.Location = New-Object Drawing.Point(310, 440)
     $panel.Controls.Add($btnSave)
 
     $btnCancel = New-Object Windows.Forms.Button
@@ -3844,7 +6226,7 @@ $btnConfig.Add_Click({
     $btnCancel.Width = 90
     $btnCancel.Height = 30
     $btnCancel.Anchor = "Bottom,Right"
-$btnCancel.Location = New-Object Drawing.Point(405, 280)
+$btnCancel.Location = New-Object Drawing.Point(405, 440)
 $panel.Controls.Add($btnCancel)
 
 $btnDefaults = New-Object Windows.Forms.Button
@@ -3852,7 +6234,7 @@ $btnDefaults.Text = "Defaults"
 $btnDefaults.Width = 90
 $btnDefaults.Height = 30
 $btnDefaults.Anchor = "Bottom,Left"
-$btnDefaults.Location = New-Object Drawing.Point(12, 280)
+$btnDefaults.Location = New-Object Drawing.Point(12, 440)
 $panel.Controls.Add($btnDefaults)
 
 $btnCancel.Add_Click({ $cForm.Close() })
@@ -3878,6 +6260,11 @@ $btnDefaults.Add_Click({
         $cbTickets.Checked = $true
         $cbFollow.Checked = $true
         $cbAuto.Checked = $true
+        $cbAssign.Checked = $false
+        $udLookback.Value = 90
+        $udHalfLife.Value = 14
+        $tDomain.Text = ""
+        $cbVerbose.Checked = $false
         Log "Config reset to defaults"
     }
 })
@@ -3891,6 +6278,11 @@ $btnSave.Add_Click({
         $script:EnableTicketingGui     = [bool]$cbTickets.Checked
         $script:AllowFollowClientTransfer     = [bool]$cbFollow.Checked
         $script:AutoUpdateClientIdOnTransfer  = [bool]$cbAuto.Checked
+        $script:AssignContactFromLogons       = [bool]$cbAssign.Checked
+        $script:AssignContactLookbackDays     = [int]$udLookback.Value
+        $script:AssignContactHalfLifeDays     = [int]$udHalfLife.Value
+        $script:AssignContactAllowedDomain     = $tDomain.Text.Trim()
+        $script:VerboseLogging                 = [bool]$cbVerbose.Checked
         # Re-sync silent ticket flags immediately (so in-memory state matches saved config)
         $script:EnableTicketingSilent = $script:EnableTicketingGui
         $script:EnableRenameFailureTicketing = $script:EnableTicketingGui
@@ -3907,12 +6299,35 @@ ApiKey=$enc
 CreateTicketsGui=$(if ($script:EnableTicketingGui) { 1 } else { 0 })
 FollowClientTransfers=$(if ($script:AllowFollowClientTransfer) { 1 } else { 0 })
 AutoUpdateClientIdOnTransfer=$(if ($script:AutoUpdateClientIdOnTransfer) { 1 } else { 0 })
+AssignContactFromLogons=$(if ($script:AssignContactFromLogons) { 1 } else { 0 })
+AssignContactLookbackDays=$($script:AssignContactLookbackDays)
+AssignContactHalfLifeDays=$($script:AssignContactHalfLifeDays)
+AssignContactAllowedDomain=$($script:AssignContactAllowedDomain)
+VerboseLogging=$(if ($script:VerboseLogging) { 1 } else { 0 })
 "@
         try { Merge-IniSections -FilePath $IniPath -SectionNames @('ITFlow', 'Preferences') -NewContent $newIniContent } catch {
             Log "WARN: INI merge failed (file locked), config changes saved to memory only: $($_.Exception.Message)"
         }
 
-        Log "Config saved (GUI ticketing=$($script:EnableTicketingGui); followTransfers=$AllowFollowClientTransfer; autoUpdateClientId=$AutoUpdateClientIdOnTransfer)"
+        # Sync preferences to registry when installed/elevated
+        if ($script:RegistryAllowed) {
+            try {
+                if (-not (Test-Path $RegPreferences)) { New-Item -Path $RegPreferences -Force | Out-Null }
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "CreateTicketsGui" -Value $(if ($script:EnableTicketingGui) { 1 } else { 0 }) -Type DWord
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "FollowClientTransfers" -Value $(if ($script:AllowFollowClientTransfer) { 1 } else { 0 }) -Type DWord
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "AutoUpdateClientIdOnTransfer" -Value $(if ($script:AutoUpdateClientIdOnTransfer) { 1 } else { 0 }) -Type DWord
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactFromLogons" -Value $(if ($script:AssignContactFromLogons) { 1 } else { 0 }) -Type DWord
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactLookbackDays" -Value $script:AssignContactLookbackDays -Type DWord
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactHalfLifeDays" -Value $script:AssignContactHalfLifeDays -Type DWord
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "AssignContactAllowedDomain" -Value $script:AssignContactAllowedDomain -Type String
+                Set-ItemProperty -LiteralPath $RegPreferences -Name "VerboseLogging" -Value $(if ($script:VerboseLogging) { 1 } else { 0 }) -Type DWord
+                Log "Preferences synced to registry"
+            } catch {
+                Log "WARN: Registry preference sync failed (non-fatal): $($_.Exception.Message)"
+            }
+        }
+
+        Log "Config saved (GUI ticketing=$($script:EnableTicketingGui); followTransfers=$AllowFollowClientTransfer; autoUpdateClientId=$AutoUpdateClientIdOnTransfer; assignContact=$AssignContactFromLogons; lookbackDays=$AssignContactLookbackDays; allowedDomain=$($script:AssignContactAllowedDomain); verboseLogging=$($script:VerboseLogging))"
         Refresh-OverviewUI
         $cForm.Close()
         } catch {
@@ -4040,9 +6455,11 @@ $btnInstall.Add_Click({
 
     # Step 2: Copy script to ProgramData
     try {
-        if (-not (Test-Path $installDir)) { New-Item -Path $installDir -ItemType Directory -Force | Out-Null }
+        # SECURITY (v7.5.5): same install-path hardening as the CLI -Install path.
+        Protect-InstallPath -InstallDir $installDir
         Copy-Item -Path $PSCommandPath -Destination $installPath -Force -ErrorAction Stop
-        Log "Script installed to $installPath"
+        Set-ITFlowHardenedAcl -Path $installPath | Out-Null
+        Log "Script installed to $installPath (hardened ACL applied)"
     } catch {
         Log "Script copy failed: $($_.Exception.Message)"
         [System.Windows.Forms.MessageBox]::Show(
@@ -4088,9 +6505,43 @@ $btnTest.Add_Click({
     }
 
     try {
-        Invoke-ITFlow GET "$($Config.BaseUrl)/api/v1/clients/read.php?api_key=$($Config.ApiKey)" | Out-Null
-        Set-Status "API connection successful" ([System.Drawing.Color]::DarkGreen)
-        Log "API test passed"
+        # ITFlow 26.08: a key inherits its user's module and client permissions, so
+        # a single clients/read call no longer answers "can this key do the job".
+        # An asset-sync key legitimately may not hold Clients read at all, which the
+        # old test reported as a total failure.
+        $clientIdForTest = try { [int]$Config.ClientId } catch { 0 }
+        $caps = Test-ITFlowApiCapabilities -ConfiguredClientId $clientIdForTest
+
+        foreach ($p in $caps.Probes) {
+            $mark = if ($p.Ok) { "OK  " } else { "FAIL" }
+            Log "API test [$mark] $($p.Name) - $($p.Note)"
+        }
+
+        $assetProbe = $caps.Probes | Where-Object { $_.Name -like 'Assets read*' } | Select-Object -First 1
+
+        if ($caps.AuthFailed) {
+            Set-Status "API key rejected - reissue required" ([System.Drawing.Color]::DarkRed)
+            Log "API test failed: the key was rejected. ITFlow 26.08 deleted every pre-existing key, and keys issued since expire on a set date. Create a new key under Admin Settings > API Keys and save it here."
+        }
+        elseif ($assetProbe -and $assetProbe.Ok) {
+            $failed = @($caps.Probes | Where-Object { -not $_.Ok })
+            if ($failed.Count -eq 0) {
+                Set-Status "API connection successful" ([System.Drawing.Color]::DarkGreen)
+                Log "API test passed (all probes)"
+            } else {
+                Set-Status "API OK - limited permissions" ([System.Drawing.Color]::DarkOrange)
+                Log "API test passed for asset sync, but $($failed.Count) capability probe(s) failed. The key's user is missing those module or client permissions; the features relying on them will be skipped."
+            }
+        }
+        elseif ($assetProbe -and $assetProbe.Note -like 'permission denied (403)*') {
+            Set-Status "API key valid - no asset permission" ([System.Drawing.Color]::DarkRed)
+            Log "API test failed: the key authenticated but its user's role lacks Support module access for assets (read needs Read, sync needs Modify). Grant it under Admin > Roles - no new key is needed. $($assetProbe.Note)"
+        }
+        else {
+            Set-Status "API test failed" ([System.Drawing.Color]::DarkRed)
+            $why = if ($assetProbe) { $assetProbe.Note } else { "assets read probe did not run" }
+            Log "API test failed: asset sync is not possible with this key - $why"
+        }
     } catch {
         Set-Status "API test failed" ([System.Drawing.Color]::DarkRed)
         Log $_.Exception.Message
