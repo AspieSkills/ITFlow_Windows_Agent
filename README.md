@@ -1,6 +1,6 @@
 # ITFlow Agent — User Manual
 
-## Version 8.2.2 | PowerShell 5.1 | Windows
+## Version 8.2.3 | PowerShell 5.1 | Windows
 
 ---
 
@@ -33,7 +33,7 @@ ITFlow Agent is a PowerShell-based tool that syncs Windows machine inventory to 
 - Windows 7 / Server 2008 R2 or later
 - PowerShell 5.1
 - Network access to ITFlow server
-- ITFlow **26.08 or later** (API keys are user-owned and RBAC-scoped from 26.08 onward — see [§12 ITFlow Server Compatibility](#12-itflow-server-compatibility))
+- ITFlow **26.12 or later** (API keys are user-owned and RBAC-scoped since 26.08, and 26.12 is the first version with the `X-API-Key` header authentication this agent requires — see [§12 ITFlow Server Compatibility](#12-itflow-server-compatibility))
 - ITFlow API key, issued against a user with asset read/write, contact read, and ticket create permissions on every client the agent syncs into
 - Administrative rights for: scheduled tasks, computer rename, registry writes, ACL hardening on install
 
@@ -562,7 +562,7 @@ This means `-Install` on a clean elevated machine will:
 The first line of every log shows the execution context:
 
 ```
-ITFlow Agent v8.2.2 starting (mode=Install, rename=False, elevated=yes)
+ITFlow Agent v8.2.3 starting (mode=Install, rename=False, elevated=yes)
 ```
 
 Modes: `GUI` (WinForms), `Worker` (GUI async engine), `Silent` (scheduled task / console), `Install` (setup), `Uninstall` (removal).
@@ -622,22 +622,22 @@ This flag is set once at startup: `(Test-Path $RegRoot) -and (Test-IsAdmin)`. Th
 ## 11.4 HTTP / API Plumbing
 
 -   All API calls go through `Invoke-ITFlow` → `Invoke-ITFlowChecked`, which classifies every failure (`Get-ITFlowFailureKind`) into Auth / Permission / BadRequest / Method / Server / Transport from the HTTP status code (falling back to message text), so callers never have to re-parse a raw exception.
--   Every GET is built via `New-ITFlowReadUri`, which URL-escapes the API key and every query value — a serial, hostname, or other field containing `&`, `#`, `+`, or a space no longer gets silently truncated or mismatched by the query string.
+-   Every GET is built via `New-ITFlowReadUri`, which URL-escapes every query value — a serial, hostname, or other field containing `&`, `#`, `+`, or a space no longer gets silently truncated or mismatched by the query string. The API key itself is never part of the URL; `Invoke-ITFlow` sends it as the `X-API-Key` header on every request (GET and POST alike).
 -   POST bodies are sent as explicit UTF-8 bytes with an explicit charset, so non-ASCII characters (accented names, the ticket section icons) survive instead of being replaced with `?` under Windows PowerShell 5.1's default Latin-1 encoding.
 
 ---
 
 # 12. ITFlow Server Compatibility
 
-This agent's API usage is re-verified against the ITFlow API reference and upstream source on each release; the full line-by-line assessment lives in `itflow-api-compatibility.md`. Current summary, as of **ITFlow 26.11.2** (agent v8.2.0+):
+This agent's API usage is re-verified against the ITFlow API reference and upstream source on each release; the full line-by-line assessment lives in `itflow-api-compatibility.md`. Current summary, as of **ITFlow 26.12** (agent v8.2.3+ requires 26.12 for header auth; earlier points below carried over from the 26.11.2 review against agent v8.2.0+):
 
 - **API key model (ITFlow 26.08+, required):** keys are owned by a user and inherit that user's role/module/client permissions — they no longer carry their own scope, and every pre-26.08 key was deleted by that upgrade. Issue a new key under **Admin Settings > API Keys**, against a user with asset read/write, contact read, and ticket create on every client this agent syncs into. Keys also carry an expiry date; the agent reports `AUTH FAILURE` identically for an invalid or expired key (ITFlow does not distinguish the two in its response).
-- **Transport is unchanged:** `api_key` on the query string (GET) or in the JSON body (POST); no header-based auth yet (proposed upstream, not merged). The key still appears in the web server access log on every sync — see `docs.itflow.org/api_apache-logging` for a server-side mitigation.
+- **Transport is header-only as of v8.2.3:** ITFlow 26.12 added `X-API-Key` header authentication and deprecated the old query-string/body form (still functional there for now, behind an **Admin > Settings > Security > "Take API keys in the address"** toggle, but slated for removal). The agent sends `X-API-Key` as an HTTP header on every request and no longer puts `api_key` on the query string or in the JSON body — this requires **ITFlow 26.12 or later**; a server on an older version has no header-auth support and will reject every call with v8.2.3, so such servers' agents must stay on v8.2.2 until the server is upgraded. The key no longer appears in the web server access log as a result (previously mitigated server-side via `docs.itflow.org/api_apache-logging`).
 - **Permissions are enforced per-call (403):** the agent parses ITFlow's "needs *Level* on *Module*" wording and logs exactly which role change to make; this is not an invalid key and reissuing one will not help.
 - **Asset details (`asset_specs`) and the `Display` asset type** are both used from 26.11 onward (see [§5.5](#55-asset-type-detection) and [§5.7](#57-external-display-asset-matching)).
 - **ITFlow's native Transfer to Client** (which archives the original and creates a new asset ID) is fully handled — see [§5.3](#53-transfer-following).
 
-Not yet adopted (tracked for a future release): `tickets/resolve.php` / ticket close (to auto-resolve the agent's own tickets when a condition clears), `contacts/create.php` (to create a missing contact rather than only ticketing about it), and header-based authentication once ITFlow ships it.
+Not yet adopted (tracked for a future release): `tickets/resolve.php` / ticket close (to auto-resolve the agent's own tickets when a condition clears) and `contacts/create.php` (to create a missing contact rather than only ticketing about it).
 
 ---
 
@@ -676,4 +676,4 @@ New capabilities gated by `$Enable*`/`$Push*` variables (e.g., `$PushAssetSpecs`
 
 ---
 
-*Last updated: 2026-11-20. Generated for ITFlow Agent v8.2.2. For the per-release history, see `CHANGELOG.md`; for the security assessment, see `hardening.md`; for ITFlow server-version compatibility notes, see `itflow-api-compatibility.md`.*
+*Last updated: 2026-11-23. Generated for ITFlow Agent v8.2.3. For the per-release history, see `CHANGELOG.md`; for the security assessment, see `hardening.md`; for ITFlow server-version compatibility notes, see `itflow-api-compatibility.md`.*
