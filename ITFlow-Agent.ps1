@@ -1,6 +1,6 @@
 ﻿# =====================================================
 # ITFlow PowerShell Agent
-# version - 8.2.2
+# version - 8.2.3
 # PowerShell 5.1 Compatible
 # =====================================================
 
@@ -43,7 +43,7 @@ $script:IsSystemContext = try { [Security.Principal.WindowsIdentity]::GetCurrent
 #===============================
 
 # Agent version
-$AgentVersion = "8.2.2"
+$AgentVersion = "8.2.3"
 
 # Current asset context for ticket linking (set during sync runs)
 $script:CurrentAssetId = $null
@@ -1772,8 +1772,8 @@ if ($reg -and $reg.ApiKey -and -not $Config.ApiKey) {
 
 # =====================================================
 # REMEDIATION D: BASEURL PIN ENFORCEMENT
-# The SYSTEM startup run must never send ?api_key=... to an attacker-supplied
-# host. Compare the loaded BaseUrl against the value pinned by the last elevated
+# The SYSTEM startup run must never send its X-API-Key header to an
+# attacker-supplied host. Compare the loaded BaseUrl against the value pinned by the last elevated
 # admin install/config-save; if they differ under SYSTEM, refuse the tampered
 # value and fall back to the trusted pin (neutralises API-key exfiltration even
 # where the registry key is user-writable).
@@ -2187,7 +2187,6 @@ function Set-ITFlowAssetContact {
     )
 
     $body = @{
-        api_key          = $Config.ApiKey
         asset_id         = $AssetId
         client_id        = $ClientId
         asset_contact_id = $ContactId
@@ -3016,7 +3015,6 @@ function Sync-ITFlowDisplayAssets {
             $itModel    = Get-AssetProp $liveRow "asset_model"
 
             $update = [ordered]@{
-                api_key   = $Config.ApiKey
                 client_id = [int]$ClientId
                 asset_id  = [int]$liveRow.asset_id
             }
@@ -3038,7 +3036,7 @@ function Sync-ITFlowDisplayAssets {
             try {
                 $dresp = Invoke-ITFlow POST "$($Config.BaseUrl)/api/v1/assets/update.php" $update
                 Write-ITFlowSpecsNotKept -Response $dresp -Action "Display asset update"
-                $changedKeys = ($update.Keys | Where-Object { $_ -notin @('api_key','client_id','asset_id') }) -join ', '
+                $changedKeys = ($update.Keys | Where-Object { $_ -notin @('client_id','asset_id') }) -join ', '
                 Log "Display asset updated (serial '$($display.Serial)', asset_id $($liveRow.asset_id)): $changedKeys"
             } catch {
                 # Invoke-ITFlow (not -Checked): a 'no rows changed' success=False
@@ -3242,13 +3240,14 @@ function New-ITFlowReadUri {
     # '+' or a space that is sent raw gets cut short or rewritten, reads as "not
     # found", and the caller's next step is to create a duplicate asset.
     # Null/empty values are omitted rather than sent as empty filters.
+    # The API key itself is never part of this URL - Invoke-ITFlow sends it as
+    # the X-API-Key header.
     param(
         [Parameter(Mandatory=$true)][string]$Endpoint,
         $Query = $null
     )
 
     $parts = New-Object System.Collections.Generic.List[string]
-    $parts.Add("api_key=" + [System.Uri]::EscapeDataString([string]$Config.ApiKey)) | Out-Null
     if ($Query) {
         foreach ($k in $Query.Keys) {
             $v = $Query[$k]
@@ -3257,6 +3256,9 @@ function New-ITFlowReadUri {
             if ($sv -eq "") { continue }
             $parts.Add(([System.Uri]::EscapeDataString([string]$k) + "=" + [System.Uri]::EscapeDataString($sv))) | Out-Null
         }
+    }
+    if ($parts.Count -eq 0) {
+        return "$($Config.BaseUrl)/api/v1/$($Endpoint)"
     }
     return "$($Config.BaseUrl)/api/v1/$($Endpoint)?" + ($parts -join '&')
 }
@@ -3471,6 +3473,12 @@ function Test-ITFlowApiCapabilities {
 function Invoke-ITFlow {
     param($Method, $Uri, $Body = $null)
 
+    # ITFlow 26.12 added X-API-Key header auth and the agent sends only that -
+    # no ?api_key= query parameter and no api_key field in the JSON body.
+    # HTTP header names are case-insensitive, so the exact casing here is
+    # cosmetic; it matches docs.itflow.org/api's own examples.
+    $headers = @{ 'X-API-Key' = [string]$Config.ApiKey }
+
     try {
         if ($Body) {
             # PS 5.1 encodes a string -Body as Latin-1 unless the ContentType
@@ -3479,12 +3487,14 @@ function Invoke-ITFlow {
             $json = $Body | ConvertTo-Json -Depth 6
             $jsonBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
             Invoke-RestMethod -UseBasicParsing -Method $Method -Uri $Uri `
+                -Headers $headers `
                 -Body $jsonBytes `
                 -ContentType "application/json; charset=utf-8" `
                 -TimeoutSec 90 `
                 -ErrorAction Stop
         } else {
             Invoke-RestMethod -UseBasicParsing -Method $Method -Uri $Uri `
+                -Headers $headers `
                 -TimeoutSec 90 `
                 -ErrorAction Stop
         }
@@ -3701,7 +3711,6 @@ function Create-ITFlowTicket {
     # for tickets that omit it, so leaving it out makes the priority of agent tickets
     # depend on the server version.
     $payload = @{
-        api_key         = $Config.ApiKey
         client_id       = $ClientId
         ticket_subject  = $Title
         ticket_priority = $(if ([string]::IsNullOrWhiteSpace($TicketPriority)) { "Low" } else { $TicketPriority })
@@ -3917,7 +3926,6 @@ function Start-AssetEnrollment {
     Log ("Enrollment (create): payload name='{0}' type='{1}' make='{2}' model='{3}' os='{4}' ip='{5}' mac='{6}' status='{7}'" -f $Inv.Hostname,$DetectedAssetType,$Inv.Make,$Inv.Model,$Inv.OS,$Inv.IP,$Inv.MAC,$DefaultAssetStatus)
 
     $createBody = @{
-        api_key      = $Config.ApiKey
         client_id    = [int]$EffectiveClientId
         asset_name   = $Inv.Hostname
         # Same check-in line the update path writes, so a new asset shows it from the first run
@@ -4625,7 +4633,6 @@ $script:SetAssetNameOnce = $false
             # ENFORCEMENT UPDATE (local truth)
             # =============================
             $update = @{
-                api_key   = $Config.ApiKey
                 client_id = [int]$EffectiveClientId
                 asset_id  = [int]$asset.asset_id
             }
@@ -4715,7 +4722,7 @@ $script:SetAssetNameOnce = $false
                 }
 
                 if ($resp -and "$($resp.success)" -eq "True") {
-                    $changed = $update.Keys | Where-Object { $_ -notin @('api_key','asset_id','client_id') }
+                    $changed = $update.Keys | Where-Object { $_ -notin @('asset_id','client_id') }
                     Log ("Asset updated fields: " + ($changed -join ', '))
 
                     # Update local cache only after success
